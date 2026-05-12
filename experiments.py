@@ -8,6 +8,7 @@ import torch
 
 from pathlib import Path
 from transformers import DynamicCache
+import matplotlib.pyplot as plt
 
 CURRENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CURRENT_DIR))
@@ -359,138 +360,96 @@ def experiment_kv_growth(
 # EXPERIMENT FAMILY 2 – Perplexity vs Context Length
 # ===========================================================================
 
-def experiment_perplexity_vs_context_length(
+def run_ppl_baseline(
     model_names: list[str],
     contexts: list[str],
-    seq_lengths: list[int] | None = None,
-    press_configs: dict | None = None,
+    seq_lengths: list[int] = None,
+    output_dir: Path = OUTPUT_DIR / "perplexity",
 ) -> pd.DataFrame:
     """
-    For each (model, context, seq_length, press) combination, measure perplexity
-    using harness.measure_perplexity and collect results.
-
-    Parameters
-    ----------
-    press_configs : dict | None
-        {label: press_instance_or_None}
-        e.g. {"baseline": None, "knorm": KnormPress(...)}
-        Defaults to {"baseline": None}.
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        model_name, context_type, seq_len, press_name, perplexity,
-        loss, inference_ms, avg_kv_entries
+    For every (model, context, seq_length) combination, measure perplexity
+    with no compression.  Saves one CSV and one PNG per model.
     """
-    log = logging.getLogger("ppl_vs_ctx")
-
-    if seq_lengths is None:
-        seq_lengths = [128, 256, 512, 1024]
-    if press_configs is None:
-        press_configs = {"baseline": None}
-
-    save_dir = PPL_DIR
-    save_dir.mkdir(parents=True, exist_ok=True)
+    log = logging.getLogger("ppl_baseline")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
 
+    if seq_lengths is None:
+        seq_lengths = [60, 80, 100, 120, 160, 200, 256, 320, 512]
+
     for model_name in model_names:
         if model_name not in MODEL_ID:
-            log.error("Unknown model: %s – skipping.", model_name)
+            log.error("Unknown model '%s' – skipping.", model_name)
             continue
 
+        log.info("Loading model: %s", model_name)
         model, tokenizer = load_model(model_name)
 
         for ctx_type in contexts:
             context_text = CONTEXT_MAP.get(ctx_type, PROSE_CONTEXT)
 
             for seq_len in seq_lengths:
-                for press_name, press in press_configs.items():
-                    log.info(
-                        "PPL | %s | %s | seq=%d | press=%s",
-                        model_name, ctx_type, seq_len, press_name,
-                    )
-                    try:
-                        result = measure_perplexity(
-                            model      = model,
-                            tokenizer  = tokenizer,
-                            context    = context_text,
-                            press      = press,
-                            max_length = seq_len,
-                        )
-                        rows.append(dict(
-                            model_name   = model_name,
-                            context_type = ctx_type,
-                            seq_len      = seq_len,
-                            press_name   = press_name,
-                            **result,
-                        ))
-                    except Exception:
-                        log.error(
-                            "PPL FAILED %s/%s seq=%d press=%s\n%s",
-                            model_name, ctx_type, seq_len, press_name,
-                            traceback.format_exc(),
-                        )
+                log.info("  PPL | %s | ctx=%s | seq_len=%d", model_name, ctx_type, seq_len)
+                result = measure_perplexity(
+                    model      = model,
+                    tokenizer  = tokenizer,
+                    context    = context_text,
+                    max_length = seq_len,
+                )
+                rows.append({
+                    "model_name":   model_name,
+                    "context_type": ctx_type,
+                    "seq_len":      seq_len,
+                    **result,
+                })
 
-        del model
+        del model   # free memory before loading the next model
 
     df = pd.DataFrame(rows)
-    csv_path = save_dir / "ppl_vs_ctx_length.csv"
-    df.to_csv(csv_path, index=False)
-    log.info("Saved perplexity results → %s", csv_path)
 
-    _plot_perplexity_results(df, save_dir)
+    # ── Save combined CSV ──────────────────────────────────────────────────
+    csv_path = output_dir / "ppl_baseline.csv"
+    df.to_csv(csv_path, index=False)
+    log.info("Saved CSV → %s", csv_path)
+
+    # ── One plot per model ─────────────────────────────────────────────────
+    for model_name in df["model_name"].unique():
+        _plot_model(df[df["model_name"] == model_name], model_name, output_dir)
+
     return df
 
 
-def _plot_perplexity_results(df: pd.DataFrame, save_dir: Path) -> None:
-    """Internal helper – generate perplexity plots from the results DataFrame."""
+def _plot_model(df: pd.DataFrame, model_name: str, output_dir: Path) -> None:
+    """
+    One figure per model.
+    X-axis : sequence length
+    Y-axis : perplexity
+    One line per context type (prose / code / …)
+    """
     log = logging.getLogger("plot_ppl")
-    if df.empty:
-        log.warning("No perplexity data to plot.")
-        return
+    fig, ax = plt.subplots(figsize=(7, 4))
 
-    save_dir.mkdir(parents=True, exist_ok=True)
+    for ctx_type, grp in df.groupby("context_type"):
+        grp_sorted = grp.sort_values("seq_len")
+        ax.plot(
+            grp_sorted["seq_len"],
+            grp_sorted["perplexity"],
+            marker="o",
+            label=ctx_type,
+        )
 
-    # ── Perplexity vs sequence length (one curve per press, facet per model+ctx)
-    for model_name in df["model_name"].unique():
-        for ctx_type in df["context_type"].unique():
-            sub = df[(df["model_name"] == model_name) & (df["context_type"] == ctx_type)]
-            if sub.empty:
-                continue
+    ax.set_xlabel("Sequence Length (tokens)")
+    ax.set_ylabel("Perplexity")
+    ax.set_title(f"Baseline PPL vs Sequence Length — {model_name}")
+    ax.legend(title="Context")
+    ax.grid(True, linestyle="--", alpha=0.5)
 
-            # Reuse plot_ppl_vs_ratio by mapping seq_len → effective_compression_ratio
-            # (just plot raw seq_len on x-axis; normalise to 1.0 at max seq_len)
-            max_sl = sub["seq_len"].max()
-            plot_df = sub.copy()
-            plot_df["effective_compression_ratio"] = plot_df["seq_len"] / max_sl
-            plot_df["codec_name"] = plot_df["press_name"]
-
-            path = save_dir / f"ppl_vs_seqlen_{model_name}_{ctx_type}.png"
-            try:
-                plots.plot_ppl_vs_ratio(
-                    df        = plot_df,
-                    save_path = str(path),
-                    title     = f"PPL vs Seq Length – {model_name} ({ctx_type})",
-                )
-                log.info("Saved: %s", path)
-            except Exception:
-                log.error("plot_ppl_vs_ratio failed\n%s", traceback.format_exc())
-
-    # ── Eviction-press sweep (if knorm / snapkv are present)
-    eviction_presses = {"knorm", "snapkv"}
-    eviction_df = df[df["press_name"].isin(eviction_presses)].copy()
-    if not eviction_df.empty:
-        # treat seq_len as a proxy for compression_ratio
-        max_sl = eviction_df["seq_len"].max()
-        eviction_df["compression_ratio"] = eviction_df["seq_len"] / max_sl
-        path = save_dir / "eviction_ppl_sweep.png"
-        try:
-            plots.plot_eviction_ppl_sweep(eviction_df, str(path))
-            log.info("Saved: %s", path)
-        except Exception:
-            log.error("plot_eviction_ppl_sweep failed\n%s", traceback.format_exc())
-
+    fig.tight_layout()
+    path = output_dir / f"ppl_baseline_{model_name}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    log.info("Saved plot → %s", path)
 
 # ===========================================================================
 # CLI
@@ -575,7 +534,7 @@ if __name__ == "__main__":
 
     # ── Experiment Family 2: Perplexity vs context length ───────────────────
     if run_ppl:
-        experiment_perplexity_vs_context_length(
+        run_ppl_baseline(
             model_names = args.models,
             contexts    = args.contexts,
             seq_lengths = args.seq_lengths,
