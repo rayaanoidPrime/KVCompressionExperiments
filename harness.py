@@ -1,5 +1,9 @@
+import logging
+from pathlib import Path
 import time
 
+from matplotlib import pyplot as plt
+import pandas as pd
 from transformers import DynamicCache
 from utils import tokenize
 import torch
@@ -97,3 +101,100 @@ def measure_perplexity(
         "inference_ms":            dt,
         "avg_kv_entries":          avg_kv,
     }
+
+
+def measure_decoding_latency(
+    model,
+    tokenizer,
+    context: str,
+    seq_lengths: list[int],
+    output_dir: Path,
+    model_name: str = "model",
+) -> pd.DataFrame:
+    """
+    For each seq_len in seq_lengths:
+      - Tokenise `context` to `seq_len` tokens as the prompt
+      - Autoregressively decode one token at a time until `seq_len`
+        additional tokens have been generated
+      - Record per-step latency and KV cache size
+
+    Saves one CSV and one PNG to `output_dir`.
+    """
+    log = logging.getLogger("decoding_latency")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log.info("Using device: %s", device)
+    model = model.to(device)
+    model.eval()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+
+    for seq_len in seq_lengths:
+        log.info("  seq_len=%d", seq_len)
+
+        # ── Tokenise prompt ────────────────────────────────────────────────
+        from utils import tokenize
+        input_ids = tokenize(tokenizer, context, max_length=seq_len).to(device)
+        n_prompt  = input_ids.shape[1]
+
+        if n_prompt == 0:
+            log.warning("Empty prompt for seq_len=%d - skipping.", seq_len)
+            continue
+
+        # ── Prefill ────────────────────────────────────────────────────────
+        with torch.no_grad():
+            cache = DynamicCache()
+            outputs = model(
+                input_ids,
+                past_key_values = cache,
+                cache_position  = torch.arange(n_prompt, device=device),
+                use_cache       = True,
+            )
+
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1, 1)
+        n_cached   = n_prompt
+
+        # ── Autoregressive decode — one token at a time ────────────────────
+        for step in range(seq_len):
+            if device == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            with torch.no_grad():
+                outputs = model(
+                    next_token,
+                    past_key_values = cache,
+                    cache_position  = torch.tensor([n_cached], device=device),
+                    use_cache       = True,
+                )
+
+            if device == "cuda":
+                torch.cuda.synchronize()
+            step_ms = (time.perf_counter() - t0) * 1000.0
+
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            n_cached  += 1
+
+            # KV cache size: sum key tensors across all layers
+            kv_entries = sum(
+                layer_kv[0].shape[2]          # (batch, heads, seq, head_dim)
+                for layer_kv in cache.key_cache
+                if layer_kv is not None
+            )
+
+            rows.append({
+                "seq_len":    seq_len,
+                "decode_step": step + 1,
+                "kv_entries": kv_entries,
+                "latency_ms": step_ms,
+            })
+
+    df = pd.DataFrame(rows)
+
+    # ── Save CSV ───────────────────────────────────────────────────────────
+    csv_path = output_dir / f"decoding_latency_{model_name}.csv"
+    df.to_csv(csv_path, index=False)
+    log.info("Saved CSV → %s", csv_path)
+
+    return df

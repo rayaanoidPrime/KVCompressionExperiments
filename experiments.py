@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 CURRENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CURRENT_DIR))
 
-from harness import measure_perplexity
+from harness import measure_decoding_latency, measure_perplexity
 from utils import tokenize, MODEL_ID, SUPPORTED_CTX_TYPES, load_model
 from instrumented_press import InstrumentedPress
 from context_samples import PROSE_CONTEXT, CODE_CONTEXT
@@ -451,6 +451,86 @@ def _plot_model(df: pd.DataFrame, model_name: str, output_dir: Path) -> None:
     plt.close(fig)
     log.info("Saved plot → %s", path)
 
+def _plot_decoding_latency(
+    df: pd.DataFrame,
+    model_name: str,
+    ctx_type: str,
+    output_dir: Path,
+) -> None:
+    log = logging.getLogger("decoding_latency")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    for seq_len, grp in df.groupby("seq_len"):
+        grp = grp.sort_values("decode_step")
+        axes[0].plot(grp["decode_step"], grp["latency_ms"], label=f"prompt={seq_len}")
+        axes[1].plot(grp["kv_entries"],  grp["latency_ms"], label=f"prompt={seq_len}")
+
+    axes[0].set_xlabel("Decode Step")
+    axes[0].set_ylabel("Latency (ms)")
+    axes[0].set_title("Decoding Latency vs Step")
+    axes[0].legend(title="Prompt Length")
+    axes[0].grid(True, linestyle="--", alpha=0.5)
+
+    axes[1].set_xlabel("KV Cache Entries")
+    axes[1].set_ylabel("Latency (ms)")
+    axes[1].set_title("Decoding Latency vs KV Cache Size")
+    axes[1].legend(title="Prompt Length")
+    axes[1].grid(True, linestyle="--", alpha=0.5)
+
+    fig.suptitle(f"Decoding Latency — {model_name} ({ctx_type})", fontweight="bold")
+    fig.tight_layout()
+
+    plot_path = output_dir / f"decoding_latency_{model_name}_{ctx_type}.png"
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    log.info("Saved plot → %s", plot_path)
+
+
+def run_decoding_latencys(
+    model_names: list[str],
+    contexts: list[str],
+    seq_lengths: list[int],
+    output_dir: Path,
+) -> pd.DataFrame:
+    log = logging.getLogger("decoding_latency")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_rows = []
+
+    for model_name in model_names:
+        if model_name not in MODEL_ID:
+            log.error("Unknown model '%s' – skipping.", model_name)
+            continue
+
+        log.info("Loading model: %s", model_name)
+        model, tokenizer = load_model(model_name)
+
+        for ctx_type in contexts:
+            context_text = CONTEXT_MAP.get(ctx_type, PROSE_CONTEXT)
+
+            df = measure_decoding_latency(
+                model       = model,
+                tokenizer   = tokenizer,
+                context     = context_text,
+                seq_lengths = seq_lengths,
+                model_name  = model_name,
+            )
+
+            df["model_name"]   = model_name
+            df["context_type"] = ctx_type
+            all_rows.append(df)
+
+            _plot_decoding_latency(df, model_name, ctx_type, output_dir)
+
+        del model
+
+    combined = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+    csv_path = output_dir / "decoding_latency_all.csv"
+    combined.to_csv(csv_path, index=False)
+    log.info("Saved combined CSV → %s", csv_path)
+
+    return combined
 # ===========================================================================
 # CLI
 # ===========================================================================
