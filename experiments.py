@@ -6,7 +6,6 @@ import traceback
 from pathlib import Path
 import logging 
 import argparse
-
 CURRENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CURRENT_DIR))
 
