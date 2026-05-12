@@ -1,11 +1,11 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Cache, DynamicCache, LlamaForCausalLM, QuantizedCache, Qwen2ForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, Cache, QuantizedCache, Qwen2ForCausalLM
 from transformers.cache_utils import QuantizedLayer
 
-MODEL_PATHS = {
-    "TinyLlama": r".models\TinyLlama-1.1B-Chat-v1.0",
-    "Qwen": r".models\Qwen2.5-0.5B-Instruct",
-}
+# MODEL_PATHS = {
+#     "TinyLlama": r".models\TinyLlama-1.1B-Chat-v1.0",
+#     "Qwen": r".models\Qwen2.5-0.5B-Instruct",
+# }
 
 
 MODEL_ID = {
@@ -17,14 +17,14 @@ SUPPORTED_CTX_TYPES = ("prose", "code")
 
 
 def load_model(model_name, eager=False):
-    path = MODEL_PATHS[model_name]
-    tokenizer = AutoTokenizer.from_pretrained(path)
+    model_id = MODEL_ID[model_name]
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     kwargs = {"torch_dtype": torch.float16, "device_map": "cpu"}
     if eager:
         kwargs["attn_implementation"] = "eager"
-    model = AutoModelForCausalLM.from_pretrained(path, **kwargs).eval()
+    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs).eval()
     return model, tokenizer
 
 

@@ -5,8 +5,8 @@ from typing import Generator
 
 import torch
 from torch import nn
+from typing import Any
 from transformers import (
-    Any,
     Cache,
     LlamaForCausalLM,
     PreTrainedModel,
@@ -14,7 +14,6 @@ from transformers import (
     Qwen2ForCausalLM,
 )
 
-from KVCompressionExperiments.utils import SUPPORTED_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +21,7 @@ SUPPORTED_MODELS = (
     LlamaForCausalLM,
     Qwen2ForCausalLM,
 )
-from KVCompressionExperiments.utils import extract_keys_and_values
+from utils import extract_keys_and_values
 
 @dataclass
 class BasePress:

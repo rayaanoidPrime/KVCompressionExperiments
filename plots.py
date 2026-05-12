@@ -30,23 +30,42 @@ def plot_kv_growth(df, save_path):
 
 
 def plot_magnitude_heatmap(captured_keys_dict, tokenizer, save_path, layer_idx, context_type_label):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 6))
-    for row_i, ctx in enumerate(["prose", "code"]):
+    # Derive models and contexts from the keys present in captured_keys_dict
+    present_keys = list(captured_keys_dict.keys())
+    ctxs   = sorted({k[1] for k in present_keys})
+    models = sorted({k[0] for k in present_keys})
+
+    fig, axes = plt.subplots(len(ctxs), len(models), figsize=(7 * len(models), 3 * len(ctxs)))
+    # Normalise axes to always be 2-D array
+    if len(ctxs) == 1 and len(models) == 1:
+        axes = [[axes]]
+    elif len(ctxs) == 1:
+        axes = [axes]
+    elif len(models) == 1:
+        axes = [[ax] for ax in axes]
+
+    for row_i, ctx in enumerate(ctxs):
         row_data = []
-        for col_j, model_name in enumerate(["TinyLlama", "Qwen"]):
-            k = captured_keys_dict[(model_name, ctx)][layer_idx][0].norm(dim=-1).numpy()
+        for model_name in models:
+            key = (model_name, ctx)
+            if key in captured_keys_dict:
+                k = captured_keys_dict[key][layer_idx][0].norm(dim=-1).numpy()
+            else:
+                k = np.zeros((1, 1))
             row_data.append(k)
         vmax = max(d.max() for d in row_data)
-        for col_j, model_name in enumerate(["TinyLlama", "Qwen"]):
-            ax = axes[row_i, col_j]
+        for col_j, model_name in enumerate(models):
+            ax = axes[row_i][col_j]
             im = ax.imshow(row_data[col_j], aspect="auto", cmap="inferno", vmin=0, vmax=vmax)
             ax.set_title(f"{model_name} - {ctx}")
             ax.set_xlabel("Sequence Position")
             ax.set_ylabel("Head Index")
             plt.colorbar(im, ax=ax)
+
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
 
 def plot_kv_distributions(captured_keys, captured_values, save_path, model_names, layer_idx):
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -75,19 +94,29 @@ def plot_kv_distributions(captured_keys, captured_values, save_path, model_names
 
 def plot_channel_variance(instrumented_stats_dict, save_path, context_type):
     model_names = list(instrumented_stats_dict.keys())
-    layer_indices = sorted(instrumented_stats_dict[model_names[0]].keys())
-    early = layer_indices[0]
-    middle = layer_indices[len(layer_indices) // 2]
-    late = layer_indices[-1]
-    fig, axes = plt.subplots(3, 2, figsize=(14, 10))
-    for ri, lidx in enumerate([early, middle, late]):
-        for ci, mn in enumerate(model_names):
-            ax = axes[ri, ci]
+    n_models = len(model_names)
+
+    fig, axes = plt.subplots(3, n_models, figsize=(7 * n_models, 10))
+    # Normalise to always be 2-D
+    if n_models == 1:
+        axes = [[axes[0]], [axes[1]], [axes[2]]]
+
+    for ci, mn in enumerate(model_names):
+        layer_indices = sorted(instrumented_stats_dict[mn].keys())
+        if not layer_indices:
+            continue
+        early  = layer_indices[0]
+        middle = layer_indices[len(layer_indices) // 2]
+        late   = layer_indices[-1]
+
+        for ri, lidx in enumerate([early, middle, late]):
+            ax = axes[ri][ci]
             cv = instrumented_stats_dict[mn][lidx]["k_channel_var"]
             ax.bar(range(len(cv)), cv, color=BLUE, alpha=0.7, width=1.0)
             ax.set_title(f"{mn} Layer {lidx}")
             ax.set_xlabel("Channel")
             ax.set_ylabel("Variance")
+
     fig.suptitle(f"Per-Channel Variance ({context_type})")
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -95,25 +124,33 @@ def plot_channel_variance(instrumented_stats_dict, save_path, context_type):
 
 def plot_token_variance(instrumented_stats_dict, save_path, context_type):
     model_names = list(instrumented_stats_dict.keys())
-    layer_indices = sorted(instrumented_stats_dict[model_names[0]].keys())
-    early = layer_indices[0]
-    middle = layer_indices[len(layer_indices) // 2]
-    late = layer_indices[-1]
-    fig, axes = plt.subplots(3, 2, figsize=(14, 10))
-    for ri, lidx in enumerate([early, middle, late]):
-        for ci, mn in enumerate(model_names):
-            ax = axes[ri, ci]
+    n_models = len(model_names)
+
+    fig, axes = plt.subplots(3, n_models, figsize=(7 * n_models, 10))
+    if n_models == 1:
+        axes = [[axes[0]], [axes[1]], [axes[2]]]
+
+    for ci, mn in enumerate(model_names):
+        layer_indices = sorted(instrumented_stats_dict[mn].keys())
+        if not layer_indices:
+            continue
+        early  = layer_indices[0]
+        middle = layer_indices[len(layer_indices) // 2]
+        late   = layer_indices[-1]
+
+        for ri, lidx in enumerate([early, middle, late]):
+            ax = axes[ri][ci]
             tv = np.array(instrumented_stats_dict[mn][lidx]["k_token_var"])
             for h in range(tv.shape[0]):
                 ax.plot(tv[h], linewidth=1, alpha=0.6)
             ax.set_title(f"{mn} Layer {lidx}")
             ax.set_xlabel("Token Position")
             ax.set_ylabel("Variance")
+
     fig.suptitle(f"Per-Token Variance ({context_type})")
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-
 
 def plot_layer_depth_profiles(layer_stats_df, save_path):
     fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
@@ -419,23 +456,3 @@ def plot_crossover_comparison(df, save_path):
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-
-def plot_needle_heatmap(df, save_path):
-    pivot = df.pivot(index="press_name", columns="needle_position", values="mean_exact_match")
-    fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn", vmin=0, vmax=1)
-    ax.set_xticks(range(len(pivot.columns)))
-    ax.set_xticklabels([f"{c:.1f}" for c in pivot.columns])
-    ax.set_yticks(range(len(pivot.index)))
-    ax.set_yticklabels(pivot.index)
-    for i in range(len(pivot.index)):
-        for j in range(len(pivot.columns)):
-            val = pivot.values[i, j]
-            ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=9)
-    ax.set_xlabel("Needle Position")
-    ax.set_ylabel("Press")
-    ax.set_title("Needle-in-a-Haystack Accuracy")
-    plt.colorbar(im, ax=ax)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
