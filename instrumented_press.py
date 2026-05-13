@@ -156,7 +156,18 @@ class InstrumentedPress(BasePress):
                         row[col] = s.get(col, None)
                 writer.writerow(row)
 
+    def load(self, path: Union[str, Path]):
+        path = Path(path)
+
+        with open(path / "instrumented_stats.json", "r") as f:
+            self.layer_stats = json.load(f)
+
+        self.captured_keys = torch.load(path / "captured_keys.pt")
+        self.captured_values = torch.load(path / "captured_values.pt")
+
     def reset(self):
         self.captured_keys.clear()
         self.captured_values.clear()
         self.layer_stats.clear()
+
+    

@@ -125,7 +125,7 @@ def load_instrumented_data(
         for ctx_type in contexts:
             path = INST_DIR / model_name / ctx_type
             if not path.exists():
-                log.warning("No saved data at %s – skipping.", path)
+                log.warning("No saved data at %s - skipping.", path)
                 continue
             press = InstrumentedPress()
             press.load(str(path))
@@ -142,7 +142,6 @@ def _build_plot_inputs(
     instrumented: dict[tuple[str, str], InstrumentedPress],
     model_names: list[str],
     contexts: list[str],
-    layer_idx: int,
 ) -> dict:
     captured_keys_dict: dict = {}   # {(model, ctx): full list[Tensor]}
     captured_vals_dict: dict = {}   # {(model, ctx): full list[Tensor]}
@@ -166,7 +165,7 @@ def _build_plot_inputs(
                 layer_stats_rows.append(dict(
                     model_name         = model_name,
                     context_type       = ctx_type,
-                    layer_idx          = lidx,
+                    layer_idx          = int(lidx),
                     k_abs_norm         = stats["k_abs_norm"],
                     k_outlier_fraction = stats["k_outlier_fraction"],
                     k_delta_norm       = stats["k_delta_norm"],
@@ -210,49 +209,61 @@ def plot_kv_attention_figures(
     instrumented: dict[tuple[str, str], InstrumentedPress],
     model_names: list[str],
     contexts: list[str],
-    layer_idx: int = 0,
+    layer_idx: list[int] = None,
     tokenizer=None,
 ) -> None:
     log = logging.getLogger("plot_kv_attention")
     save_dir = PLOT_DIR / "kv_attention"
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    inputs = _build_plot_inputs(instrumented, model_names, contexts, layer_idx)
+    inputs = _build_plot_inputs(instrumented, model_names, contexts)
 
-    ckeys  = inputs["captured_keys_dict"]   # {(model, ctx): list[Tensor]}
-    cvals  = inputs["captured_vals_dict"]   # {(model, ctx): list[Tensor]}
+    ckeys  = inputs["captured_keys_dict"]   # {(model, ctx): {lidx: list[Tensor]}}
+    cvals  = inputs["captured_vals_dict"]   # {(model, ctx): {lidx: list[Tensor]}}
     istats = inputs["instrumented_stats"]   # {model: {lidx: {...}}}
     ls_df  = inputs["layer_stats_df"]
 
-    # ── 1. Activation magnitude heatmaps ────────────────────────────────────
-    for ctx_type in contexts:
-        path = save_dir / f"magnitude_heatmap_{ctx_type}.png"
+    available_layers = set.intersection(
+        *[set(v.keys()) for v in ckeys.values()]
+    ) if ckeys else set()
+    valid_layer_idx = sorted(l for l in layer_idx if l in available_layers)
+    if not valid_layer_idx:
+        log.warning("None of the requested layer_idx %s exist in data (available: %s). Falling back to first middle and last", layer_idx, sorted(available_layers))
+        valid_layer_idx = sorted(available_layers)[0, len(available_layers) // 2, -1]
+    log.info("Using layer indices: %s", valid_layer_idx)
+    layer_idx = valid_layer_idx  # use the safe list from here on
+
+   
+    for ctx_type, lidx in [(c, l) for c in contexts for l in layer_idx]:
+
+        # 1. Magnitude heatmaps
+        heatmap_dir = save_dir / "attention_heatmaps"
+        heatmap_dir.mkdir(parents=True, exist_ok=True)
+        path = heatmap_dir/ f"magnitude_heatmap_{ctx_type}_{lidx}.png"
         try:
             plots.plot_magnitude_heatmap(
                 captured_keys_dict = ckeys,
                 tokenizer          = tokenizer,
                 save_path          = str(path),
-                layer_idx          = layer_idx,
+                layer_idx          = lidx,
                 context_type_label = ctx_type,
             )
             log.info("Saved: %s", path)
         except Exception:
             log.error("magnitude_heatmap %s failed\n%s", ctx_type, traceback.format_exc())
 
-    # ── 2. Keys vs Values distributions ─────────────────────────────────────
-    for ctx_type in contexts:
-        ck_ctx = {mn: ckeys[(mn, ctx_type)] for mn in model_names if (mn, ctx_type) in ckeys}
-        cv_ctx = {mn: cvals[(mn, ctx_type)] for mn in model_names if (mn, ctx_type) in cvals}
-        if not ck_ctx:
-            continue
-        path = save_dir / f"kv_distributions_{ctx_type}.png"
+        # 2. KV distribution plots
+        distribution_dir = save_dir / "kv_distributions"
+        distribution_dir.mkdir(parents=True, exist_ok=True)
+        path = distribution_dir / f"kv_distributions_{ctx_type}_{lidx}.png"
         try:
             plots.plot_kv_distributions(
-                captured_keys   = ck_ctx,
-                captured_values = cv_ctx,
+                captured_keys   = ckeys,
+                captured_values = cvals,
                 save_path       = str(path),
-                model_names     = list(ck_ctx.keys()),
-                layer_idx       = layer_idx,
+                model_names     = list(set([key[0] for key in ckeys.keys() if key[1] == ctx_type])),
+                ctx_type        = ctx_type,
+                layer_idx       = lidx,
             )
             log.info("Saved: %s", path)
         except Exception:
@@ -553,7 +564,7 @@ def parse_cli() -> argparse.Namespace:
         help="Which experiment families to run.",
     )
     parser.add_argument(
-        "--layer-idx", type=int, default=0,
+        "--layer-idx", nargs="+", type=int, default=[0, 10, 19],
         help="Layer index used for per-layer plots.",
     )
     parser.add_argument(

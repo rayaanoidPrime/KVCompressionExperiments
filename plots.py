@@ -67,18 +67,20 @@ def plot_magnitude_heatmap(captured_keys_dict, tokenizer, save_path, layer_idx, 
     plt.close(fig)
 
 
-def plot_kv_distributions(captured_keys, captured_values, save_path, model_names, layer_idx):
+def plot_kv_distributions(captured_keys, captured_values, save_path, model_names: list[str], ctx_type: str, layer_idx: int):
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     all_data = []
     for mn in model_names:
-        k = captured_keys[mn][layer_idx].flatten()
-        v = captured_values[mn][layer_idx].flatten()
+        key = (mn, ctx_type)
+        print('Attempting key:', key, ' → types:', type(mn), type(ctx_type))
+        k = captured_keys[(mn, ctx_type)][layer_idx].flatten()
+        v = captured_values[(mn, ctx_type)][layer_idx].flatten()
         all_data.extend([k, v])
     global_lo = np.percentile(np.concatenate([d.numpy() for d in all_data]), 1)
     global_hi = np.percentile(np.concatenate([d.numpy() for d in all_data]), 99)
     for ri, mn in enumerate(model_names):
-        k = captured_keys[mn][layer_idx].flatten().numpy()
-        v = captured_values[mn][layer_idx].flatten().numpy()
+        k = captured_keys[(mn, ctx_type)][layer_idx].flatten().numpy()
+        v = captured_values[(mn, ctx_type)][layer_idx].flatten().numpy()
         k_clip = k[(k >= global_lo) & (k <= global_hi)]
         v_clip = v[(v >= global_lo) & (v <= global_hi)]
         axes[0, ri].hist(k_clip, bins=100, color=BLUE, alpha=0.7, density=True)
