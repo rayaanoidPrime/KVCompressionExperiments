@@ -9,8 +9,8 @@ from torch import nn
 from torch import Tensor
 from transformers import QuantizedCache
 
-from KVCompressionExperiments.base_press import BasePress
-from KVCompressionExperiments.utils import extract_keys_and_values
+from base_press import BasePress
+from utils import extract_keys_and_values
 
 logger = logging.getLogger(__name__)
 
