@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 INST_DIR = ROOT / "experiment-outputs" / "instrumented"
 OUT_DIR = ROOT / "report-plots"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
