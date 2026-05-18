@@ -230,7 +230,7 @@ These baselines were collected using `llama-perplexity` and `llama-bench` on a Q
 
 ![PPL vs Context Length](llamacpp_baseline_results/ppl_vs_ctx.png)
 
-*Figure 11: Perplexity vs. context length for FP16, Q8_0, and Q4_0 KV cache quantization (Qwen3-1.7B, wikitext-2).*
+*Figure 11: Perplexity vs. context length for FP16, Q8_0, and Q4_0 KV cache quantization (Qwen2.5-0.5B, wikitext-2).*
 
 **Analysis.**
 
@@ -250,7 +250,7 @@ Q4_0	32.40	+27.4%	4×
 
 ![Latency vs Context Length](llamacpp_baseline_results/latency_vs_ctx.png)
 
-*Figure 12: Single-token decode latency vs. prefill context length for FP16, Q8_0, and Q4_0 KV caches (Qwen3-1.7B, Intel i7-7820X).*
+*Figure 12: Single-token decode latency vs. prefill context length for FP16, Q8_0, and Q4_0 KV caches (Qwen2.5-0.5B, Intel i7-7820X).*
 
 **Analysis.**
 
