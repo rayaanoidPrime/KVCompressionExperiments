@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+import statistics
 import time
 
 from matplotlib import pyplot as plt
@@ -103,98 +104,139 @@ def measure_perplexity(
     }
 
 
-def measure_decoding_latency(
+def measure_latency(
     model,
-    tokenizer,
-    context: str,
-    seq_lengths: list[int],
-    output_dir: Path,
-    model_name: str = "model",
-) -> pd.DataFrame:
+    press:None,
+    prompt_tokens: int,
+    n_gen: int = 128,
+    n_reps: int = 5,
+    n_warmup: int = 2,
+    device: str = "cpu",
+) -> dict:
     """
-    For each seq_len in seq_lengths:
-      - Tokenise `context` to `seq_len` tokens as the prompt
-      - Autoregressively decode one token at a time until `seq_len`
-        additional tokens have been generated
-      - Record per-step latency and KV cache size
+    Measure prefill, TTFT, and per-token decode latency.
 
-    Saves one CSV and one PNG to `output_dir`.
+    Args:
+        model:         HuggingFace model (already on `device`)
+        prompt_tokens: Number of prompt tokens to prefill
+        n_gen:         Number of new tokens to generate after prefill
+        n_reps:        Number of timed repetitions (mean/stddev reported)
+        n_warmup:      Number of warmup passes (untimed)
+        device:        Target device (currently CPU only)
+
+    Returns:
+        dict with keys:
+            prefill_ms_mean, prefill_ms_std,
+            ttft_ms_mean,    ttft_ms_std,
+            decode_ms_mean,  decode_ms_std,   # per token
+            total_ms_mean,   total_ms_std
     """
-    log = logging.getLogger("decoding_latency")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info("Using device: %s", device)
-    model = model.to(device)
+    assert device == "cpu", "Only CPU timing is supported."
     model.eval()
+    model.to(device)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
+    # --- Build a fixed dummy prompt (shape: [1, prompt_tokens]) ---
+    dummy_input = torch.zeros(1, prompt_tokens, dtype=torch.long, device=device)
 
-    for seq_len in seq_lengths:
-        log.info("  seq_len=%d", seq_len)
+    # ------------------------------------------------------------------
+    # Helper: run one full prefill + n_gen decode steps, return timings
+    # ------------------------------------------------------------------
+    def _run_once() -> tuple[float, float, float, float]:
+        """Returns (prefill_ns, ttft_ns, decode_per_tok_ns, total_ns)."""
 
-        # ── Tokenise prompt ────────────────────────────────────────────────
-        from utils import tokenize
-        input_ids = tokenize(tokenizer, context, max_length=seq_len).to(device)
-        n_prompt  = input_ids.shape[1]
+        ctx = press(model) if press is not None else torch.inference_mode()
+        with ctx:
 
-        if n_prompt == 0:
-            log.warning("Empty prompt for seq_len=%d - skipping.", seq_len)
-            continue
+            cache = DynamicCache()  # fresh cache for this rep
+            # ── 1. PREFILL ──────────────────────────────────────────
+            cache_position = torch.arange(prompt_tokens, device=device)
 
-        # ── Prefill ────────────────────────────────────────────────────────
-        with torch.no_grad():
-            cache = DynamicCache()
-            outputs = model(
-                input_ids,
-                past_key_values = cache,
-                cache_position  = torch.arange(n_prompt, device=device),
-                use_cache       = True,
+            t0 = time.perf_counter_ns()
+            out = model(
+                input_ids=dummy_input,
+                cache_position=cache_position,
+                past_key_values=cache,
+                use_cache=True,
             )
+            t1 = time.perf_counter_ns()
 
-        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1, 1)
-        n_cached   = n_prompt
+            prefill_ns = t1 - t0
+            past = out.past_key_values
 
-        # ── Autoregressive decode — one token at a time ────────────────────
-        for step in range(seq_len):
-            if device == "cuda":
-                torch.cuda.synchronize()
-            t0 = time.perf_counter()
+            # ── 2. FIRST DECODE STEP (needed for TTFT) ──────────────
+            next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            cache_position = torch.tensor([prompt_tokens], device=device)
 
-            with torch.no_grad():
-                outputs = model(
-                    next_token,
-                    past_key_values = cache,
-                    cache_position  = torch.tensor([n_cached], device=device),
-                    use_cache       = True,
+            t2 = time.perf_counter_ns()
+            out = model(
+                input_ids=next_token,
+                cache_position=cache_position,
+                past_key_values=past,
+                use_cache=True,
+            )
+            t3 = time.perf_counter_ns()
+
+            first_decode_ns = t3 - t2
+            ttft_ns = prefill_ns + first_decode_ns
+            past = out.past_key_values
+
+            # ── 3. REMAINING DECODE STEPS ───────────────────────────
+            decode_times = [first_decode_ns]
+
+            for step in range(1, n_gen):
+                next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                cache_position = torch.tensor([prompt_tokens + step], device=device)
+
+                t4 = time.perf_counter_ns()
+                out = model(
+                    input_ids=next_token,
+                    cache_position=cache_position,
+                    past_key_values=past,
+                    use_cache=True,
                 )
+                t5 = time.perf_counter_ns()
 
-            if device == "cuda":
-                torch.cuda.synchronize()
-            step_ms = (time.perf_counter() - t0) * 1000.0
+                decode_times.append(t5 - t4)
+                past = out.past_key_values
 
-            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            n_cached  += 1
+            decode_per_tok_ns = statistics.mean(decode_times)
+            total_ns = prefill_ns + sum(decode_times)
 
-            # KV cache size: sum key tensors across all layers
-            kv_entries = sum(
-                layer_kv[0].shape[2]          # (batch, heads, seq, head_dim)
-                for layer_kv in cache.key_cache
-                if layer_kv is not None
-            )
+        return prefill_ns, ttft_ns, decode_per_tok_ns, total_ns
 
-            rows.append({
-                "seq_len":    seq_len,
-                "decode_step": step + 1,
-                "kv_entries": kv_entries,
-                "latency_ms": step_ms,
-            })
+    # ------------------------------------------------------------------
+    # Warmup passes (cache object is NOT the same across reps anyway,
+    # but this primes the CPU caches / JIT / etc.)
+    # ------------------------------------------------------------------
+    for _ in range(n_warmup):
+        _run_once()
 
-    df = pd.DataFrame(rows)
+    # ------------------------------------------------------------------
+    # Timed repetitions
+    # ------------------------------------------------------------------
+    prefill_list, ttft_list, decode_list, total_list = [], [], [], []
 
-    # ── Save CSV ───────────────────────────────────────────────────────────
-    csv_path = output_dir / f"decoding_latency_{model_name}.csv"
-    df.to_csv(csv_path, index=False)
-    log.info("Saved CSV → %s", csv_path)
+    for _ in range(n_reps):
+        p, tt, d, tot = _run_once()
+        prefill_list.append(p / 1e6)   # ns → ms
+        ttft_list.append(tt / 1e6)
+        decode_list.append(d / 1e6)
+        total_list.append(tot / 1e6)
 
-    return df
+    def _stats(lst):
+        mean = statistics.mean(lst)
+        std  = statistics.stdev(lst) if len(lst) > 1 else 0.0
+        return mean, std
+
+    pm, ps   = _stats(prefill_list)
+    tm, ts   = _stats(ttft_list)
+    dm, ds   = _stats(decode_list)
+    totm, tots = _stats(total_list)
+
+    return {
+        "prefill_ms_mean":  pm,   "prefill_ms_std":  ps,
+        "ttft_ms_mean":     tm,   "ttft_ms_std":     ts,
+        "decode_ms_mean":   dm,   "decode_ms_std":   ds,   # per token
+        "total_ms_mean":    totm, "total_ms_std":    tots,
+    }

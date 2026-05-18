@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 CURRENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CURRENT_DIR))
 
-from harness import measure_decoding_latency, measure_perplexity
+from harness import measure_latency, measure_perplexity
 from utils import tokenize, MODEL_ID, SUPPORTED_CTX_TYPES, load_model
 from instrumented_press import InstrumentedPress
 from context_samples import PROSE_CONTEXT, CODE_CONTEXT
@@ -462,84 +462,175 @@ def _plot_model(df: pd.DataFrame, model_name: str, output_dir: Path) -> None:
     plt.close(fig)
     log.info("Saved plot → %s", path)
 
-def _plot_decoding_latency(
+def _plot_latency(
     df: pd.DataFrame,
-    model_name: str,
-    ctx_type: str,
     output_dir: Path,
 ) -> None:
+    """
+    For each model, produces one figure with 3 subplots (A, B, C):
+        A — Prefill latency   (prefill_ms_mean  ± prefill_ms_std)   vs seq_len, one line per press_type
+        B — Decode latency    (decode_ms_mean   ± decode_ms_std)    vs seq_len, one line per press_type
+        C — Total latency     (total_ms_mean    ± total_ms_std)     vs seq_len, one line per press_type
+
+    One row of subplots (A, B, C) is produced per model_name.
+    All press types are overlaid on the same subplot for easy comparison.
+
+    Saved to: output_dir / "latency_<model_name>.png"
+    """
     log = logging.getLogger("decoding_latency")
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    for seq_len, grp in df.groupby("seq_len"):
-        grp = grp.sort_values("decode_step")
-        axes[0].plot(grp["decode_step"], grp["latency_ms"], label=f"prompt={seq_len}")
-        axes[1].plot(grp["kv_entries"],  grp["latency_ms"], label=f"prompt={seq_len}")
+    model_names = df["model_name"].unique()
 
-    axes[0].set_xlabel("Decode Step")
-    axes[0].set_ylabel("Latency (ms)")
-    axes[0].set_title("Decoding Latency vs Step")
-    axes[0].legend(title="Prompt Length")
-    axes[0].grid(True, linestyle="--", alpha=0.5)
+    for model_name in model_names:
+        mdf = df[df["model_name"] == model_name].copy()
+        mdf = mdf.sort_values("seq_len")
 
-    axes[1].set_xlabel("KV Cache Entries")
-    axes[1].set_ylabel("Latency (ms)")
-    axes[1].set_title("Decoding Latency vs KV Cache Size")
-    axes[1].legend(title="Prompt Length")
-    axes[1].grid(True, linestyle="--", alpha=0.5)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    fig.suptitle(f"Decoding Latency — {model_name} ({ctx_type})", fontweight="bold")
-    fig.tight_layout()
+        # ── Subplot definitions ───────────────────────────────────────
+        subplots = [
+            {
+                "ax":        axes[0],
+                "label":     "A",
+                "y_mean":    "prefill_ms_mean",
+                "y_std":     "prefill_ms_std",
+                "title":     "Prefill Latency vs Prompt Length",
+                "y_label":   "Prefill Latency (ms)",
+            },
+            {
+                "ax":        axes[1],
+                "label":     "B",
+                "y_mean":    "decode_ms_mean",
+                "y_std":     "decode_ms_std",
+                "title":     "Decode Latency vs Prompt Length",
+                "y_label":   "Decode Latency (ms/tok)",
+            },
+            {
+                "ax":        axes[2],
+                "label":     "C",
+                "y_mean":    "total_ms_mean",
+                "y_std":     "total_ms_std",
+                "title":     "Total Latency vs Prompt Length",
+                "y_label":   "Total Latency (ms)",
+            },
+        ]
 
-    plot_path = output_dir / f"decoding_latency_{model_name}_{ctx_type}.png"
-    fig.savefig(plot_path, dpi=150)
-    plt.close(fig)
-    log.info("Saved plot → %s", plot_path)
+        press_types = mdf["press_type"].unique()
+
+        for sp in subplots:
+            ax = sp["ax"]
+
+            for press_label in press_types:
+                cdf = mdf[mdf["press_type"] == press_label].sort_values("seq_len")
+
+                x      = cdf["seq_len"].to_numpy()
+                y_mean = cdf[sp["y_mean"]].to_numpy()
+                y_std  = cdf[sp["y_std"]].to_numpy()
+
+                line, = ax.plot(x, y_mean, marker="o", label=press_label)
+                ax.fill_between(
+                    x,
+                    y_mean - y_std,
+                    y_mean + y_std,
+                    alpha=0.15,
+                    color=line.get_color(),
+                )
+
+            ax.set_xlabel("Prompt Length (tokens)")
+            ax.set_ylabel(sp["y_label"])
+            ax.set_title(f"({sp['label']}) {sp['title']}")
+            ax.legend(title="Quant Type")
+            ax.grid(True, linestyle="--", alpha=0.5)
+
+        fig.suptitle(f"Latency Benchmark — {model_name}", fontweight="bold", fontsize=13)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+        safe_name = model_name.replace("/", "_").replace(" ", "_")
+        plot_path = output_dir / f"latency_{safe_name}.png"
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        log.info("Saved plot → %s", plot_path)
 
 
-def run_decoding_latencys(
+def run_latencies(
     model_names: list[str],
-    contexts: list[str],
-    seq_lengths: list[int],
     output_dir: Path,
+    seq_lengths: list[int],
+    n_gen: int = 128,
+    n_reps: int = 5,
+    n_warmup: int = 2,
+    press_configs: dict | None = None,   # e.g. { "q8": FP8Press, "q4": ...}
 ) -> pd.DataFrame:
+    """
+    Sweeps over model_names x seq_lengths x cache_configs,
+    calls measure_latency() for each combination, and returns a combined DataFrame.
+
+    Args:
+        model_names:   List of model keys (must exist in MODEL_ID)
+        seq_lengths:   List of prompt token lengths to sweep over
+        output_dir:    Directory to write CSV and plots
+        n_gen:         Tokens to generate per measurement
+        n_reps:        Timed repetitions passed to measure_latency()
+        n_warmup:      Warmup passes passed to measure_latency()
+        press_configs: Dict mapping label → press Object (no-arg callable).
+    """
     log = logging.getLogger("decoding_latency")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows = []
 
+    if press_configs is None:
+        press_configs = {"uncompressed": None}  # default to no compression
+
     for model_name in model_names:
         if model_name not in MODEL_ID:
-            log.error("Unknown model '%s' – skipping.", model_name)
+            log.error("Unknown model '%s' - skipping.", model_name)
             continue
 
         log.info("Loading model: %s", model_name)
         model, tokenizer = load_model(model_name)
 
-        for ctx_type in contexts:
-            context_text = CONTEXT_MAP.get(ctx_type, PROSE_CONTEXT)
+        for seq_len in seq_lengths:
+            for press_label, press in press_configs.items():
 
-            df = measure_decoding_latency(
-                model       = model,
-                tokenizer   = tokenizer,
-                context     = context_text,
-                seq_lengths = seq_lengths,
-                model_name  = model_name,
-            )
+                log.info(
+                    "  model=%s  seq_len=%d  press=%s",
+                    model_name, seq_len, press_label,
+                )
 
-            df["model_name"]   = model_name
-            df["context_type"] = ctx_type
-            all_rows.append(df)
+                results = measure_latency(
+                    model         = model,
+                    press         = press,
+                    prompt_tokens = seq_len,
+                    n_gen         = n_gen,
+                    n_reps        = n_reps,
+                    n_warmup      = n_warmup,
+                )
 
-            _plot_decoding_latency(df, model_name, ctx_type, output_dir)
+                # Flatten the returned dict into one row
+                row = {
+                    "model_name":   model_name,
+                    "seq_len":      seq_len,
+                    "press_type":   press_label,
+                    "n_gen":        n_gen,
+                    **results,      # prefill_ms_mean/std, ttft_ms_mean/std, etc.
+                }
+                all_rows.append(row)
 
+        # Free GPU/CPU memory before next model
         del model
+        torch.cuda.empty_cache()   # no-op on CPU, safe to call anyway
 
-    combined = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+    # ── Combine, save, plot ───────────────────────────────────────────
+    combined = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
-    csv_path = output_dir / "decoding_latency_all.csv"
-    combined.to_csv(csv_path, index=False)
-    log.info("Saved combined CSV → %s", csv_path)
+    if not combined.empty:
+        csv_path = output_dir / "decoding_latency_all.csv"
+        combined.to_csv(csv_path, index=False)
+        log.info("Saved combined CSV → %s", csv_path)
+
+        _plot_latency(combined, output_dir)
 
     return combined
 # ===========================================================================
@@ -556,10 +647,13 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--contexts", nargs="+", choices=["prose", "code"], default=["prose", "code"],
     )
+    parser.add_argument(
+        "--latency", action="store_true", help="Whether to run latency benchmarks (in addition to KV/attention and PPL experiments)."
+    )
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument(
         "--experiments", nargs="+",
-        choices=["instrumented", "kv_growth", "ppl_vs_ctx", "all"],
+        choices=["instrumented", "kv_growth", "ppl_vs_ctx", "latency", "all"],
         default=["all"],
         help="Which experiment families to run.",
     )
@@ -595,6 +689,7 @@ if __name__ == "__main__":
     run_instrumented = run_all or "instrumented" in args.experiments
     run_kv_growth    = run_all or "kv_growth"    in args.experiments
     run_ppl          = run_all or "ppl_vs_ctx"   in args.experiments
+    run_latency       = run_all or "latency"       in args.experiments
 
     log.info("Models: %s | Contexts: %s", args.models, args.contexts)
 
@@ -629,6 +724,22 @@ if __name__ == "__main__":
             model_names = args.models,
             contexts    = args.contexts,
             seq_lengths = args.seq_lengths,
+        )
+
+    if run_latency:
+        run_latencies(
+            model_names= args.models,
+            seq_lengths= args.seq_lengths if args.seq_lengths is not None else [60, 80, 100, 120, 160, 200, 256, 320, 512],
+            output_dir = OUTPUT_DIR / "latency",
+            n_gen      = 128,
+            n_reps     = 5,
+            n_warmup   = 2,
+            press_configs = {
+                "uncompressed": None,
+                # "q8": FP8Press,
+                # "q4": FP4Press,
+            },
+
         )
 
     log.info("All experiments complete. Outputs in: %s", OUTPUT_DIR)

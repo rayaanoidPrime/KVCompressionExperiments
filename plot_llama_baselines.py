@@ -26,7 +26,8 @@ _BASE = os.path.expanduser(
 D_LATENCY_CSV  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_BASE, "d_latency_vs_ctx.csv")
 PG_LATENCY_CSV = sys.argv[2] if len(sys.argv) > 2 else os.path.join(_BASE, "pg_latency_vs_ctx.csv")
 PPL_CSV        = sys.argv[3] if len(sys.argv) > 3 else os.path.join(_BASE, "ppl_vs_ctx.csv")
-OUT_DIR        = sys.argv[4] if len(sys.argv) > 4 else os.path.dirname(D_LATENCY_CSV)
+# Fix 4: safe OUT_DIR default — os.path.dirname returns "" for bare filenames
+OUT_DIR        = sys.argv[4] if len(sys.argv) > 4 else (os.path.dirname(D_LATENCY_CSV) or ".")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -35,7 +36,6 @@ KV_ORDER  = ["f16", "q8_0", "q4_0"]
 KV_COLORS = {"f16": "#2196F3", "q8_0": "#FF9800", "q4_0": "#4CAF50"}
 KV_LABELS = {"f16": "FP16 KV", "q8_0": "Q8_0 KV", "q4_0": "Q4_0 KV"}
 
-# Column names inferred from the d_latency header (same schema for pg_latency)
 LLAMA_BENCH_COLUMNS = [
     "build_commit", "build_number", "cpu_info", "gpu_info", "backends",
     "model_filename", "model_type", "model_size", "model_n_params",
@@ -84,33 +84,60 @@ def _load_bench_csv(csv_path: str) -> pd.DataFrame:
 
 def _prep_bench_df(df: pd.DataFrame) -> pd.DataFrame:
     """Cast numeric columns and derive avg_ms / stddev_ms."""
-    for col in ("n_depth", "avg_ns", "stddev_ns", "n_gen", "n_prompt"):
+    for col in ("n_depth", "avg_ns", "stddev_ns", "avg_ts", "stddev_ts",
+                "n_gen", "n_prompt"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Warn on unexpected NaNs introduced by the cast
+    for col in ("n_prompt", "n_gen", "n_depth"):
+        if col in df.columns:
+            n_null = df[col].isna().sum()
+            if n_null > 0:
+                print(f"[WARN] {n_null} NaN value(s) in '{col}' after numeric cast — "
+                      "check for malformed rows")
 
     df["avg_ms"]    = df["avg_ns"]    / 1e6
     df["stddev_ms"] = df["stddev_ns"] / 1e6
     return df
 
 
+def _ms_per_tok(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add avg_ms_per_tok / stddev_ms_per_tok columns derived from avg_ts
+    (tokens/sec) using first-order error propagation:
+        L = 1000 / T  →  σ_L = (1000 / T²) × σ_T
+    """
+    df = df.copy()
+    df["avg_ms_per_tok"]    = 1000.0 / df["avg_ts"]
+    df["stddev_ms_per_tok"] = 1000.0 * df["stddev_ts"] / (df["avg_ts"] ** 2)
+    return df
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Plot 1 – Decode latency vs n_depth  (n_prompt=0, n_gen=1)
+# Plot 1 – Decode latency vs n_depth  (n_prompt=0, n_gen>0)
 # ══════════════════════════════════════════════════════════════════════════════
 def plot_d_latency(csv_path: str, out_dir: str) -> None:
     print(f"[INFO] Reading decode-latency CSV: {csv_path}")
     df = _load_bench_csv(csv_path)
     df = _prep_bench_df(df)
 
-    required = {"n_depth", "type_k", "avg_ns", "stddev_ns"}
+    required = {"n_depth", "type_k", "avg_ts", "stddev_ts"}
     missing  = required - set(df.columns)
     if missing:
         raise ValueError(f"Decode-latency CSV missing columns: {missing}\nFound: {list(df.columns)}")
 
-    # Keep only pure decode rows: n_prompt==0, n_gen==1
-    if {"n_gen", "n_prompt"}.issubset(df.columns):
-        df = df[(df["n_gen"] == 1) & (df["n_prompt"] == 0)]
+    # Fix 1: use n_gen > 0 (not == 1) so it works regardless of n_gen value
+    df = df[(df["n_gen"] > 0) & (df["n_prompt"] == 0)]
+    if df.empty:
+        raise ValueError(
+            "Decode-latency filter (n_gen>0, n_prompt==0) matched no rows — "
+            "check n_gen / n_prompt values in the CSV"
+        )
 
-    df = df.dropna(subset=["n_depth", "avg_ms"]).sort_values("n_depth")
+    # Fix 2: plot ms/token derived from avg_ts, not total avg_ms
+    df = _ms_per_tok(df)
+    df = df.dropna(subset=["n_depth", "avg_ms_per_tok"]).sort_values("n_depth")
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -120,8 +147,8 @@ def plot_d_latency(csv_path: str, out_dir: str) -> None:
             print(f"[WARN] No decode-latency data for kv={kv}")
             continue
         ax.errorbar(
-            sub["n_depth"], sub["avg_ms"],
-            yerr=sub["stddev_ms"],
+            sub["n_depth"], sub["avg_ms_per_tok"],
+            yerr=sub["stddev_ms_per_tok"],
             label=KV_LABELS.get(kv, kv),
             color=KV_COLORS.get(kv, None),
             marker="o", markersize=6,
@@ -129,14 +156,15 @@ def plot_d_latency(csv_path: str, out_dir: str) -> None:
         )
 
     ax.set_xlabel("Prefill context length  (n_depth, tokens)")
-    ax.set_ylabel("Single-token decode latency  (ms)")
-    ax.set_title("Decode Latency vs Prefill Context Length\n(n_gen=1, n_prompt=0 — KV cache pre-filled)")
+    ax.set_ylabel("Decode latency per token  (ms/tok)")
+    ax.set_title("Decode Latency vs Prefill Context Length\n"
+                 "(n_prompt=0, KV cache pre-filled via n_depth)")
     ax.legend(title="KV cache type", framealpha=0.9)
     ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
     out_path = os.path.join(out_dir, "d_latency_vs_ctx.png")
     fig.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"[INFO] Saved → {out_path}")
 
@@ -145,41 +173,44 @@ def plot_d_latency(csv_path: str, out_dir: str) -> None:
 # Plot 2 – Prefill-generate latency vs n_depth  (three sub-plots)
 #
 #  The PG bench emits three rows per (kv_type, n_depth) combination:
-#    A)  n_prompt=512, n_gen=0    → prefill-only   throughput (avg_ts = tok/s)
-#    B)  n_prompt=0,   n_gen=128  → decode-only    throughput (avg_ts = tok/s)
-#    C)  n_prompt=512, n_gen=128  → prefill+decode  total latency (avg_ns)
+#    A)  n_prompt=512, n_gen=0    → prefill-only   (ms/tok via avg_ts)
+#    B)  n_prompt=0,   n_gen=128  → decode-only    (ms/tok via avg_ts)
+#    C)  n_prompt=512, n_gen=128  → prefill+decode  (ms/tok via avg_ts)
 #
-#  We expose all three as separate sub-plots in one figure.
+#  All three sub-plots use ms/token for a consistent Y-axis scale.
 # ══════════════════════════════════════════════════════════════════════════════
 def plot_pg_latency(csv_path: str, out_dir: str) -> None:
     print(f"[INFO] Reading prefill-generate latency CSV: {csv_path}")
     df = _load_bench_csv(csv_path)
     df = _prep_bench_df(df)
 
-    required = {"n_depth", "type_k", "avg_ns", "stddev_ns", "n_prompt", "n_gen"}
+    required = {"n_depth", "type_k", "avg_ts", "stddev_ts", "n_prompt", "n_gen"}
     missing  = required - set(df.columns)
     if missing:
         raise ValueError(f"PG-latency CSV missing columns: {missing}\nFound: {list(df.columns)}")
 
-    df = df.dropna(subset=["n_depth", "avg_ms"]).sort_values("n_depth")
+    df = df.dropna(subset=["n_depth", "avg_ts"]).sort_values("n_depth")
 
-    # ── Partition into the three test types ──────────────────────────────────
-    df_prefill = df[(df["n_prompt"] == 512) & (df["n_gen"] == 0)].copy()   # A
-    df_decode  = df[(df["n_prompt"] == 0)   & (df["n_gen"] == 128)].copy() # B
-    df_pg      = df[(df["n_prompt"] == 512) & (df["n_gen"] == 128)].copy() # C
+    # Partition into the three test types
+    df_prefill = df[(df["n_prompt"] == 512) & (df["n_gen"] == 0)].copy()    # A
+    df_decode  = df[(df["n_prompt"] == 0)   & (df["n_gen"] == 128)].copy()  # B
+    df_pg      = df[(df["n_prompt"] == 512) & (df["n_gen"] == 128)].copy()  # C
 
-    # avg_ts is tokens/s for A and B; convert to ms/token for readability
-    # For C we use total wall-clock latency in ms (avg_ms)
-    for sub_df in (df_prefill, df_decode):
-        sub_df["avg_ts"]    = pd.to_numeric(sub_df["avg_ts"],    errors="coerce")
-        sub_df["stddev_ts"] = pd.to_numeric(sub_df["stddev_ts"], errors="coerce")
-        # ms per token  =  1000 / (tok/s)
-        sub_df["avg_ms_per_tok"]    = 1000.0 / sub_df["avg_ts"]
-        sub_df["stddev_ms_per_tok"] = 1000.0 * sub_df["stddev_ts"] / (sub_df["avg_ts"] ** 2)
+    for label, sub_df in (("prefill-only", df_prefill),
+                           ("decode-only",  df_decode),
+                           ("prefill+gen",  df_pg)):
+        if sub_df.empty:
+            print(f"[WARN] No rows matched for partition '{label}' — "
+                  "check n_prompt / n_gen values in the CSV")
+
+    # Fix 3: convert all three partitions to ms/token for consistent units
+    df_prefill = _ms_per_tok(df_prefill)
+    df_decode  = _ms_per_tok(df_decode)
+    df_pg      = _ms_per_tok(df_pg)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=False)
 
-    # ── Sub-plot A: prefill-only (ms per prefill token) ──────────────────────
+    # ── Sub-plot A: prefill-only (ms/tok) ────────────────────────────────────
     ax = axes[0]
     for kv in KV_ORDER:
         sub = df_prefill[df_prefill["type_k"] == kv]
@@ -199,7 +230,7 @@ def plot_pg_latency(csv_path: str, out_dir: str) -> None:
     ax.legend(title="KV cache type", framealpha=0.9)
     ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
-    # ── Sub-plot B: decode-only (ms per generated token) ─────────────────────
+    # ── Sub-plot B: decode-only (ms/tok) ─────────────────────────────────────
     ax = axes[1]
     for kv in KV_ORDER:
         sub = df_decode[df_decode["type_k"] == kv]
@@ -219,7 +250,7 @@ def plot_pg_latency(csv_path: str, out_dir: str) -> None:
     ax.legend(title="KV cache type", framealpha=0.9)
     ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
-    # ── Sub-plot C: full prefill+generate total wall-clock (ms) ──────────────
+    # ── Sub-plot C: prefill+generate (ms/tok) ────────────────────────────────
     ax = axes[2]
     for kv in KV_ORDER:
         sub = df_pg[df_pg["type_k"] == kv]
@@ -227,18 +258,19 @@ def plot_pg_latency(csv_path: str, out_dir: str) -> None:
             print(f"[WARN] No prefill+generate data for kv={kv}")
             continue
         ax.errorbar(
-            sub["n_depth"], sub["avg_ms"],
-            yerr=sub["stddev_ms"],
+            sub["n_depth"], sub["avg_ms_per_tok"],
+            yerr=sub["stddev_ms_per_tok"],
             label=KV_LABELS.get(kv, kv),
             color=KV_COLORS.get(kv, None),
             marker="D", markersize=6, linewidth=2, capsize=4, capthick=1.5,
         )
     ax.set_xlabel("Prefill context length  (n_depth, tokens)")
-    ax.set_ylabel("Total wall-clock latency  (ms)")
+    ax.set_ylabel("Latency per token  (ms/tok)")
     ax.set_title("Prefill + Generate Latency\n(n_prompt=512, n_gen=128)")
     ax.legend(title="KV cache type", framealpha=0.9)
     ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
+    # Fix 9: y=1.02 is safe here because bbox_inches="tight" is used on savefig
     fig.suptitle("Prefill-Generate Latency vs Prefill Context Length", fontsize=13, y=1.02)
     out_path = os.path.join(out_dir, "pg_latency_vs_ctx.png")
     fig.tight_layout()
@@ -248,7 +280,7 @@ def plot_pg_latency(csv_path: str, out_dir: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Plot 3 – Perplexity vs context length  (unchanged schema)
+# Plot 3 – Perplexity vs context length
 # ══════════════════════════════════════════════════════════════════════════════
 def plot_ppl(csv_path: str, out_dir: str) -> None:
     print(f"[INFO] Reading PPL CSV: {csv_path}")
@@ -261,8 +293,11 @@ def plot_ppl(csv_path: str, out_dir: str) -> None:
         raise ValueError(f"PPL CSV missing columns: {missing}\nFound: {list(df.columns)}")
 
     df["ctx"] = pd.to_numeric(df["ctx"], errors="coerce")
-    df["ppl"] = pd.to_numeric(df["ppl"], errors="coerce")  # ERROR rows → NaN, dropped
+    df["ppl"] = pd.to_numeric(df["ppl"], errors="coerce")  # ERROR rows → NaN, dropped below
     df = df.dropna(subset=["ctx", "ppl"]).sort_values("ctx")
+
+    if df.empty:
+        raise ValueError("PPL CSV contains no valid (ctx, ppl) rows after parsing")
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -286,7 +321,7 @@ def plot_ppl(csv_path: str, out_dir: str) -> None:
 
     out_path = os.path.join(out_dir, "ppl_vs_ctx.png")
     fig.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     print(f"[INFO] Saved → {out_path}")
 
@@ -324,4 +359,5 @@ if __name__ == "__main__":
 
     if errors:
         sys.exit(1)
+
     print("\n[INFO] Done.")
