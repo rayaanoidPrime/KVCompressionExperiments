@@ -102,11 +102,16 @@ These baselines measure *uncompressed* perplexity as a function of context lengt
 
 **Table 1: Best and worst perplexity per model/context (no compression).**
 
-**Model**	**Context**	**Best PPL**	**Worst PPL**	**Range**
-TinyLlama	code	1.25 (160 tok)	2.41 (60 tok)	1.16×
-TinyLlama	prose	3.48 (200 tok)	7.27 (60 tok)	2.09×
-Qwen	code	1.42 (120 tok)	3.04 (60 tok)	2.14×
-Qwen	prose	4.42 (160 tok)	8.06 (320 tok)	1.82×
+### Best and worst perplexity per model/context (no compression)
+
+
+| Model | Context | Best PPL | Worst PPL | Range |
+| :--- | :--- | :--- | :--- | :--- |
+| TinyLlama | code | 1.25 (160 tok) | 2.41 (60 tok) | 1.16× |
+| TinyLlama | prose | 3.48 (200 tok) | 7.27 (60 tok) | 2.09× |
+| Qwen | code | 1.42 (120 tok) | 3.04 (60 tok) | 2.14× |
+| Qwen | prose | 4.42 (160 tok) | 8.06 (320 tok) | 1.82× |
+
 
 
 ---
@@ -234,16 +239,19 @@ These baselines were collected using `llama-perplexity` and `llama-bench` on a Q
 
 **Analysis.**
 
-- **Q8_0 is near-lossless.** Across all context lengths, Q8_0 perplexity tracks FP16 almost exactly (within 0.6%). At 512 tokens: FP16 = 15.08, Q8_0 = 15.17.
-- **Q4_0 degrades noticeably.** PPL increases by 20–30% vs. FP16. At 512 tokens: Q4_0 = 18.06, a +19.7% increase. At 200 tokens the gap is widest: FP16 = 31.69, Q4_0 = 42.40 (+33.8%).
-- **The gap is context-length-dependent.** Q4_0 degradation is largest at 200–320 tokens, possibly because the quantization error interacts non-linearly with the attention pattern at those lengths.
+- **Q8_0 is near-lossless.** Across all context lengths, Q8_0 perplexity tracks FP16 almost exactly. At 512 tokens: FP16 = 15.08, Q8_0 = 15.17.
+- **Q4_0 degrades noticeably.** PPL increases by a considerable margin vs. FP16. At 512 tokens: Q4_0 = 94.53, a +598% increase. At 160 tokens the gap is widest.
+- **The gap is context-length-dependent.** Q4_0 degradation is largest at 160 - 200 tokens, possibly because the quantization error interacts non-linearly with the attention pattern at those lengths.
 
-**Table 2: Average PPL across all context lengths per KV type.**
+### Table 2: Average PPL across all context lengths per KV type.
 
-**KV Type**	**Mean PPL**	**vs. FP16**	**Compression**
-FP16	25.44	—	1× (baseline)
-Q8_0	25.57	+0.5%	2×
-Q4_0	32.40	+27.4%	4×
+
+| KV Type | Mean PPL | vs. FP16 | Compression |
+| :--- | :--- | :--- | :--- |
+| **f16** | 22.9209 | 1.00× | 1.00× |
+| **q8_0** | 23.4876 | 1.02× | 2.00× |
+| **q4_0** | 162.1735 | 7.08× | 4.00× |
+
 
 
 ### 6.2 Decode Latency
@@ -258,12 +266,15 @@ Q4_0	32.40	+27.4%	4×
 - **Latency is largely flat with context length** for all three KV types on this hardware — the attention computation is not the bottleneck at these short context lengths (60–256).
 - **The latency benefit comes from memory bandwidth.** Smaller KV cache entries reduce DRAM traffic during the attention score computation, which dominates on CPU inference.
 
-**Table 3: Average decode latency per KV type.**
+### Table 3: Average decode latency per KV type.
 
-**KV Type**	**Mean Latency (ms)**	**Speedup**	**Bytes/Element**
-FP16	115.9	1.00×	2
-Q8_0	64.6	1.79×	1
-Q4_0	38.2	3.03×	0.5
+
+| KV Type | Mean Latency (ms) | Speedup | Bytes/Element |
+| :--- | :--- | :--- | :--- |
+| **FP16** | 115.9 | 1.00× | 2 |
+| **Q8_0** | 64.6 | 1.79× | 1 |
+| **Q4_0** | 38.2 | 3.03× | 0.5 |
+
 
 
 **Trade-off summary.** Q8_0 offers a "free lunch" — near-zero PPL cost with a 1.8× latency improvement. Q4_0 trades 27% higher PPL for 3× speedup. The sweet spot for most applications is likely Q8_0.
@@ -288,7 +299,7 @@ Based on the evidence collected, compression approaches are ranked by expected e
 
 6. **Delta encoding. Weak signal for values, moderate for keys.** Key deltas show 30–93% compressibility, but *value* deltas are *anti-compressible* (negative compressibility). Delta encoding should only be applied to keys, and even then, benefits vary dramatically by layer and model.
 
-7. **4-bit quantization. Weak signal for quality.** llama.cpp Q4_0 degrades PPL by 20–30%, which is likely unacceptable for most applications. However, if aggressive compression is needed, combining Q4_0 with error compensation or calibration-aware quantization could close some of this gap.
+7. **4-bit quantization. Weak signal for quality.** llama.cpp Q4_0 degrades PPL by ~600% at its peak, which is unacceptable for most applications. However, if aggressive compression is needed, combining Q4_0 with error compensation or calibration-aware quantization could close some of this gap.
 
 ---
 
