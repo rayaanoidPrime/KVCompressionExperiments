@@ -12,13 +12,13 @@
 set -euo pipefail
 
 # ── User-provided arguments ────────────────────────────────────────
-MODEL="${1:-Qwen3-1.7B}"
+MODEL="${1:-qwen2.5-0.5b-instruct}"
 BIN_DIR="${2:-$HOME/a1264472/work/llama.cpp/build-cpu/bin}"
 CORPUS="${3:-}"
 OUT_DIR="${4:-$HOME/a1264472/work/KVCompressionExperiments/llamacpp_baseline_results}"
 
 # ── Paths to the different GGUF formats ───────────────────────────
-BF16_PATH="$HOME/a1264472/work/${MODEL}-BF16.gguf"
+BF16_PATH="$HOME/a1264472/work/${MODEL}-fp16.gguf"
 
 
 # ── Experiment parameters ─────────────────────────────────────────
@@ -27,7 +27,8 @@ THREADS=$(nproc)
 
 mkdir -p "$OUT_DIR/logs"
 
-LATENCY_CSV="$OUT_DIR/latency_vs_ctx.csv"
+LATENCY_D_CSV="$OUT_DIR/d_latency_vs_ctx.csv"
+LATENCY_PG_CSV="$OUT_DIR/pg_latency_vs_ctx.csv"
 PPL_CSV="$OUT_DIR/ppl_vs_ctx.csv"
 
 # ── FIX 2: Verify required binaries exist ─────────────────────────
@@ -73,8 +74,9 @@ echo "=== Latency sweep ==="
 # Write header once from the first run
 HEADER_WRITTEN=0
 
+# run only for the bf16 model
 for kv in "${KV_TYPES[@]}"; do
-    MODEL_PATH=$(get_model_path "$kv")
+    MODEL_PATH=$BF16_PATH
     if [[ -z "$MODEL_PATH" ]]; then
         echo "[WARN] Unknown KV type '$kv' — skipping."
         continue
@@ -84,7 +86,7 @@ for kv in "${KV_TYPES[@]}"; do
         continue
     fi
 
-    log="$OUT_DIR/logs/bench_kv${kv}.log"
+    log="$OUT_DIR/logs/bench_d_kv${kv}.log"
 
     "$BIN_DIR/llama-bench" \
         -m "$MODEL_PATH" \
@@ -92,7 +94,7 @@ for kv in "${KV_TYPES[@]}"; do
         -t "$THREADS" \
         -p 0 \
         -n 1 \
-        -d 60,80,100,120,160,200,256 \
+        -d 60,80,100,120,160,200,256,320,512 \
         -ctk "$kv" \
         -ctv "$kv" \
         -fa 1 \
@@ -101,14 +103,36 @@ for kv in "${KV_TYPES[@]}"; do
 
     if [[ "$HEADER_WRITTEN" -eq 0 ]]; then
         # Write header + data rows
-        cat "$log" >> "$LATENCY_CSV"
-        HEADER_WRITTEN=1
+        cat "$log" >> "$LATENCY_D_CSV"
     else
         # Skip the header line (line 1), append only data rows
-        tail -n +2 "$log" >> "$LATENCY_CSV"
+        tail -n +2 "$log" >> "$LATENCY_D_CSV"
     fi
 
     echo "[INFO] Latency benchmark for KV=$kv completed — log: $log"
+
+    log="$OUT_DIR/logs/bench_pg_kv${kv}.log"
+
+    "$BIN_DIR/llama-bench" \
+        -m "$MODEL_PATH" \
+        -ngl 0 \
+        -t "$THREADS" \
+        -pg  512,128 \
+        -d 60,80,100,120,160,200,256,320,512 \
+        -ctk "$kv" \
+        -ctv "$kv" \
+        -fa 1 \
+        -o csv > "$log" 2>&1 \
+        || { echo "[ERROR] Benchmark failed for KV=$kv (prefill-generate) — check: $log"; continue; }
+
+    if [[ "$HEADER_WRITTEN" -eq 0 ]]; then
+        # Write header + data rows
+        cat "$log" >> "$LATENCY_PG_CSV"
+        HEADER_WRITTEN=1
+    else
+        # Skip the header line (line 1), append only data rows
+        tail -n +2 "$log" >> "$LATENCY_PG_CSV"
+    fi
 done
 
 
@@ -152,6 +176,7 @@ done
 # ── Final summary ─────────────────────────────────────────────────
 echo ""
 echo "=== All done! Results saved in $OUT_DIR ==="
-echo "  Latency CSV  : $LATENCY_CSV"
+echo "  D Latency CSV  : $LATENCY_D_CSV"
+echo "  PG Latency CSV : $LATENCY_PG_CSV"
 echo "  Perplexity CSV : $PPL_CSV"
 echo "  Logs folder  : $OUT_DIR/logs"

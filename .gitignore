@@ -1,3 +1,6 @@
 .venv
 *.png
 *.log
+.cache/
+logs/
+*.gguf
