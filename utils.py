@@ -25,6 +25,7 @@ def load_model(model_name, eager=False):
     if eager:
         kwargs["attn_implementation"] = "eager"
     model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs).eval()
+    model = model.to(torch.bfloat16)
     return model, tokenizer
 
 

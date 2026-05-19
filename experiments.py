@@ -1,8 +1,8 @@
+import os
 import sys
 import traceback
 import argparse
 import logging
-import numpy as np
 import pandas as pd
 import torch
 
@@ -477,7 +477,7 @@ def _plot_latency(
 
     Saved to: output_dir / "latency_<model_name>.png"
     """
-    log = logging.getLogger("decoding_latency")
+    log = logging.getLogger("latency")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_names = df["model_name"].unique()
@@ -557,9 +557,9 @@ def run_latencies(
     model_names: list[str],
     output_dir: Path,
     seq_lengths: list[int],
-    n_gen: int = 128,
-    n_reps: int = 5,
-    n_warmup: int = 2,
+    n_gen: int = 32,
+    n_reps: int = 2,
+    n_warmup: int = 1,
     press_configs: dict | None = None,   # e.g. { "q8": FP8Press, "q4": ...}
 ) -> pd.DataFrame:
     """
@@ -575,7 +575,8 @@ def run_latencies(
         n_warmup:      Warmup passes passed to measure_latency()
         press_configs: Dict mapping label → press Object (no-arg callable).
     """
-    log = logging.getLogger("decoding_latency")
+    log = logging.getLogger("latency")
+    torch.set_num_threads(os.cpu_count())
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_rows = []
@@ -598,9 +599,10 @@ def run_latencies(
                     "  model=%s  seq_len=%d  press=%s",
                     model_name, seq_len, press_label,
                 )
-
+                
+                active_model = model
                 results = measure_latency(
-                    model         = model,
+                    model         = active_model,
                     press         = press,
                     prompt_tokens = seq_len,
                     n_gen         = n_gen,
@@ -626,7 +628,7 @@ def run_latencies(
     combined = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
     if not combined.empty:
-        csv_path = output_dir / "decoding_latency_all.csv"
+        csv_path = output_dir / "latency_all.csv"
         combined.to_csv(csv_path, index=False)
         log.info("Saved combined CSV → %s", csv_path)
 

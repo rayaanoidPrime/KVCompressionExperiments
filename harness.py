@@ -1,10 +1,7 @@
-import logging
-from pathlib import Path
+import contextlib
 import statistics
 import time
 
-from matplotlib import pyplot as plt
-import pandas as pd
 from transformers import DynamicCache
 from utils import tokenize
 import torch
@@ -103,14 +100,14 @@ def measure_perplexity(
         "avg_kv_entries":          avg_kv,
     }
 
-
+@torch.inference_mode()
 def measure_latency(
     model,
     press:None,
     prompt_tokens: int,
-    n_gen: int = 128,
-    n_reps: int = 5,
-    n_warmup: int = 2,
+    n_gen: int,
+    n_reps: int,
+    n_warmup: int,
     device: str = "cpu",
 ) -> dict:
     """
@@ -142,10 +139,10 @@ def measure_latency(
     # ------------------------------------------------------------------
     # Helper: run one full prefill + n_gen decode steps, return timings
     # ------------------------------------------------------------------
-    def _run_once() -> tuple[float, float, float, float]:
+    def _run_once(warmup:bool = False) -> tuple[float, float, float, float]:
         """Returns (prefill_ns, ttft_ns, decode_per_tok_ns, total_ns)."""
 
-        ctx = press(model) if press is not None else torch.inference_mode()
+        ctx = press(model) if press is not None else contextlib.nullcontext()
         with ctx:
 
             cache = DynamicCache()  # fresh cache for this rep
@@ -181,6 +178,10 @@ def measure_latency(
             ttft_ns = prefill_ns + first_decode_ns
             past = out.past_key_values
 
+            if warmup:
+                # If this is just a warmup pass, skip the remaining decode steps
+                return prefill_ns, ttft_ns, 0.0, ttft_ns
+
             # ── 3. REMAINING DECODE STEPS ───────────────────────────
             decode_times = [first_decode_ns]
 
@@ -210,7 +211,7 @@ def measure_latency(
     # but this primes the CPU caches / JIT / etc.)
     # ------------------------------------------------------------------
     for _ in range(n_warmup):
-        _run_once()
+        _run_once(warmup=True)
 
     # ------------------------------------------------------------------
     # Timed repetitions
