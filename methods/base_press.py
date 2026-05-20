@@ -188,11 +188,16 @@ class BasePress:
         cache_layer = cache.layers[module.layer_idx]
         layer_idx = module.layer_idx
 
+        if cache is None:
+            logger.warning(f"Cache is None in forward hook of layer {layer_idx}. Skipping compression.")
+            return output
+
         # skip comprssion if we're past the prefilling phase and self.decoding is False
         if not self.should_compress(hidden_states, kwargs):
             return output
         
         keys, values = extract_keys_and_values(cache, module.layer_idx)
+        # output[1] is attn weights when output_attentions=True; else None
         attentions = output[1] if len(output) > 1 and output[1] is not None else None
                     
         # reconstructed keys, values for quantization comrpessions,
@@ -229,9 +234,17 @@ class BasePress:
         try:
             language_model = model.model.language_model if hasattr(model.model, "language_model") else model.model
             for layer in language_model.layers:         
-                layer.self_attn.rotary_emb = language_model.rotary_emb
+                # Propagate the shared rotary embedding to the attention layer
+                # only when the layer doesn't already have its own instance.
+                if not hasattr(layer.self_attn, "rotary_emb") or layer.self_attn.rotary_emb is None:
+                    layer.self_attn.rotary_emb = language_model.rotary_emb
                 hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                
+                # Opt-in pre-RoPE key hook for KVQuantPress only
+                if getattr(self, "_needs_pre_rope_keys", False):
+                    hooks.append(layer.self_attn.k_proj.register_forward_hook(self._pre_rope_key_hook))
+
             yield
         finally:
-            for forward_hook in hooks:
-                forward_hook.remove()
+            for h in hooks:
+                h.remove()

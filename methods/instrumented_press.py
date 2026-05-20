@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from base_press import BasePress
+from methods.base_press import BasePress
 
 logger = logging.getLogger(__name__)
 

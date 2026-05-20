@@ -1,103 +1,147 @@
 import contextlib
+import logging
+import math
+from pathlib import Path
 import statistics
 import time
-
 from transformers import DynamicCache
-from utils import tokenize
+from utils import WIKITEXT_PATH, load_wikitext, tokenize
 import torch
 
 
 def measure_perplexity(
-    model, tokenizer, context: str, press=None, max_length: int = 512
+    model,
+    tokenizer,
+    context_text: str,
+    p: int,
+    g: int,
+    context_path: Path = None,
+    max_length: int = 512,
+    press=None,
+    cache = None,
 ) -> dict:
-    prefix_len = max_length // 2
-    cont_len   = max_length // 2
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    prefix_len = p if p is not None else max_length // 2
+    cont_len = g if g is not None else max_length // 2
 
-    full_ids = tokenize(tokenizer, context, max_length=max_length)
-    full_ids = full_ids[0, :max_length]   # (T,)
-    n_full   = full_ids.shape[0]
+    log = logging.getLogger("Measure PPL")
 
-    # Guard: need at least 2 tokens to have a prefix and a continuation
+    log.info(
+        "measure_perplexity | device=%s | prefix_len=%d | cont_len=%d | max_length=%d",
+        device, prefix_len, cont_len, max_length,
+    )
+
+
+    if context_text is not None:
+        full_ids = tokenize(tokenizer=tokenizer, text=context_text, max_length=max_length, device=device)
+    else:
+        try:
+            full_ids = load_wikitext(tokenizer, max_length, device)
+            log.debug("Loaded WikiText → %d tokens", full_ids.shape[1])
+
+        except Exception as e:
+            print(f"An error occurred loading text: {e}")
+            return {}
+
+    n_full = full_ids.shape[1]
     if n_full < 2:
-        return {
-            "perplexity": float("nan"),
-            "loss": float("nan"),
-            "n_prefix_tokens": 0,
-            "n_continuation_tokens": 0,
-            "inference_ms": 0.0,
-            "avg_kv_entries": 0,
-        }
+        return {"perplexity": float("nan"), "loss": float("nan"), "n_prefix_tokens": 0, "n_continuation_tokens": 0, "inference_ms": 0.0, "avg_kv_entries": 0}
 
-    actual_prefix = min(prefix_len, n_full - 1)   # leave at least 1 token for continuation
-    prefix_ids = full_ids[:actual_prefix].unsqueeze(0)
-    n_prefix   = prefix_ids.shape[1]
-
+    actual_prefix = min(prefix_len, n_full - 1)
+    prefix_ids = full_ids[:, :actual_prefix]
+    n_prefix = prefix_ids.shape[1]
+    
     cont_start = n_prefix
-    cont_end   = min(cont_start + cont_len, n_full)
-    cont_ids   = full_ids[cont_start:cont_end].unsqueeze(0)
-    n_cont     = cont_ids.shape[1]
+    cont_end = min(cont_start + cont_len, n_full)
+    cont_ids = full_ids[:, cont_start:cont_end]
+    n_cont = cont_ids.shape[1]
 
-    # Guard: skip if continuation is empty
+    log.debug(
+        "Sequence split | total=%d | prefix=%d | continuation=%d",
+        n_full, n_prefix, n_cont,
+    )
+
     if n_cont == 0:
-        return {
-            "perplexity": float("nan"),
-            "loss": float("nan"),
-            "n_prefix_tokens": n_prefix,
-            "n_continuation_tokens": 0,
-            "inference_ms": 0.0,
-            "avg_kv_entries": 0,
-        }
+        return {"perplexity": float("nan"), "loss": float("nan"), "n_prefix_tokens": n_prefix, "n_continuation_tokens": 0, "inference_ms": 0.0, "avg_kv_entries": 0}
 
     t0 = time.perf_counter()
-
-    with torch.no_grad():
-        cache = DynamicCache()
-        if press is not None:
-            with press(model):
-                outputs = model(
-                    prefix_ids,
-                    past_key_values  = cache,
-                    cache_position   = torch.arange(n_prefix, device="cpu"),
-                    use_cache        = True,
-                )
-        else:
-            outputs = model(
-                prefix_ids,
-                past_key_values = cache,
-                cache_position  = torch.arange(n_prefix, device="cpu"),
-                use_cache       = True,
-            )
-
-        cont_cache_pos = torch.arange(n_prefix, n_prefix + n_cont, device="cpu")
+    ctx = press(model) if press is not None else contextlib.nullcontext()
+    
+    with torch.no_grad(), ctx:
+        # 1. Prefill Step
+        log.debug("Prefill | feeding %d prefix tokens", n_prefix)
         outputs = model(
-            cont_ids,
-            past_key_values = cache,
-            cache_position  = cont_cache_pos,
-            use_cache       = True,
-            labels          = cont_ids,
+            prefix_ids,
+            past_key_values=cache,
+            cache_position=torch.arange(n_prefix, device=device),
+            use_cache=True,
         )
-        loss = outputs.loss.item()
+        cache = outputs.past_key_values
+        
+        # Target list to collect logits that predict each token in cont_ids
+        eval_logits = []
+        # The last logit of the prefix predicts the 0-th token of cont_ids
+        eval_logits.append(outputs.logits[:, -1:, :]) 
 
+        # 2. Sequential Decoding Step (Iterative for accurate decoding time)
+        log.debug("Decode | %d autoregressive steps", n_cont - 1)
+        current_pos = n_prefix
+        for i in range(n_cont - 1):
+            # Target token to feed back into the model
+            next_input_id = cont_ids[:, i : i + 1]
+            
+            outputs = model(
+                next_input_id,
+                past_key_values=cache,
+                cache_position=torch.tensor([current_pos], device=device),
+                use_cache=True,
+            )
+            cache = outputs.past_key_values
+            eval_logits.append(outputs.logits[:, -1:, :])
+            current_pos += 1
+
+        # Combine all predictive logits: Shape (1, n_cont, vocab_size)
+        combined_logits = torch.cat(eval_logits, dim=1)
+        
+        # Loss calculation: combined_logits[:, t] directly maps to predicting cont_ids[:, t]
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(combined_logits.view(-1, combined_logits.size(-1)), cont_ids.view(-1))
+        loss_item = loss.item()
+    
     dt = (time.perf_counter() - t0) * 1000.0
 
-    avg_kv  = 0
+    # Dynamic KV cache profile estimation
+    avg_kv = 0
     n_layers = 0
-    for layer_cache in cache.layers:
-        if hasattr(layer_cache, "keys") and isinstance(layer_cache.keys, torch.Tensor):
-            avg_kv   += layer_cache.keys.shape[2]
-            n_layers += 1
-    avg_kv = avg_kv / max(n_layers, 1) if n_layers > 0 else 0
+    if hasattr(cache, "layers"):
+        for layer_cache in cache.layers:
+            if hasattr(layer_cache, "keys") and isinstance(layer_cache.keys, torch.Tensor):
+                # Shape is usually (batch, num_heads, seq_len, head_dim)
+                avg_kv += layer_cache.keys.shape[2]
+                n_layers += 1
+    elif hasattr(cache, "get_seq_length"): # fallback for static standard cache structures
+        avg_kv = cache.get_seq_length()
+        n_layers = 1
+    
+    avg_kv = avg_kv / n_layers if n_layers > 0 else 0
+    ppl = math.exp(loss_item)
 
-    import math
-    ppl = math.exp(loss)
+    if device == "cuda":
+        torch.cuda.empty_cache()
+        
+    log.info(
+        "Result | ppl=%.4f | loss=%.4f | prefix=%d | cont=%d "
+        "|  total=%.1f ms | avg_kv=%.1f",
+        ppl, loss_item, n_prefix, n_cont, dt, avg_kv,
+    )
 
     return {
-        "perplexity":              ppl,
-        "loss":                    loss,
-        "n_prefix_tokens":         n_prefix,
-        "n_continuation_tokens":   n_cont,
-        "inference_ms":            dt,
-        "avg_kv_entries":          avg_kv,
+        "perplexity": ppl,
+        "loss": loss_item,
+        "n_prefix_tokens": n_prefix,
+        "n_continuation_tokens": n_cont,
+        "inference_ms": dt,
+        "avg_kv_entries": avg_kv,
     }
 
 @torch.inference_mode()

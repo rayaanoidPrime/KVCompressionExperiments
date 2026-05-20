@@ -1,5 +1,12 @@
+import logging
+import math
+from pathlib import Path
+
 import matplotlib
+
+from experiments import OUTPUT_DIR
 matplotlib.use("Agg")
+from matplotlib import ticker
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -458,3 +465,131 @@ def plot_crossover_comparison(df, save_path):
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+def plot_quant_ppls(
+    ppl_rows: dict,
+    output_dir: Path = OUTPUT_DIR / "perplexity",
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for model_name, methods in ppl_rows.items():
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for method_label, rows in methods.items():
+            points = [
+                (row["n_prefix_tokens"] + row["n_continuation_tokens"], row["perplexity"])
+                for row in rows
+                if row.get("perplexity") is not None and not math.isnan(row["perplexity"])
+            ]
+
+            if not points:
+                continue
+
+            points.sort(key=lambda x: x[0])
+            seq_lens, ppls = zip(*points)
+
+            ax.plot(seq_lens, ppls, marker="o", linewidth=2, markersize=5, label=method_label)
+
+        ax.set_xlabel("Sequence Length (tokens)", fontsize=13)
+        ax.set_ylabel("Perplexity", fontsize=13)
+        ax.set_title(f"Perplexity vs Sequence Length — {model_name}", fontsize=14)
+        ax.legend(title="Quant Method", fontsize=11, title_fontsize=11)
+        ax.grid(True, linestyle="--", alpha=0.5)
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+        ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
+
+        plt.tight_layout()
+
+        save_path = output_dir / f"quant_ppl_{model_name}.png"
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+
+
+def _plot_latency(
+    df: pd.DataFrame,
+    output_dir: Path,
+) -> None:
+    """
+    For each model, produces one figure with 3 subplots (A, B, C):
+        A — Prefill latency   (prefill_ms_mean  ± prefill_ms_std)   vs seq_len, one line per press_type
+        B — Decode latency    (decode_ms_mean   ± decode_ms_std)    vs seq_len, one line per press_type
+        C — Total latency     (total_ms_mean    ± total_ms_std)     vs seq_len, one line per press_type
+
+    One row of subplots (A, B, C) is produced per model_name.
+    All press types are overlaid on the same subplot for easy comparison.
+
+    Saved to: output_dir / "latency_<model_name>.png"
+    """
+    log = logging.getLogger("latency")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_names = df["model_name"].unique()
+
+    for model_name in model_names:
+        mdf = df[df["model_name"] == model_name].copy()
+        mdf = mdf.sort_values("seq_len")
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # ── Subplot definitions ───────────────────────────────────────
+        subplots = [
+            {
+                "ax":        axes[0],
+                "label":     "A",
+                "y_mean":    "prefill_ms_mean",
+                "y_std":     "prefill_ms_std",
+                "title":     "Prefill Latency vs Prompt Length",
+                "y_label":   "Prefill Latency (ms)",
+            },
+            {
+                "ax":        axes[1],
+                "label":     "B",
+                "y_mean":    "decode_ms_mean",
+                "y_std":     "decode_ms_std",
+                "title":     "Decode Latency vs Prompt Length",
+                "y_label":   "Decode Latency (ms/tok)",
+            },
+            {
+                "ax":        axes[2],
+                "label":     "C",
+                "y_mean":    "total_ms_mean",
+                "y_std":     "total_ms_std",
+                "title":     "Total Latency vs Prompt Length",
+                "y_label":   "Total Latency (ms)",
+            },
+        ]
+
+        press_types = mdf["press_type"].unique()
+
+        for sp in subplots:
+            ax = sp["ax"]
+
+            for press_label in press_types:
+                cdf = mdf[mdf["press_type"] == press_label].sort_values("seq_len")
+
+                x      = cdf["seq_len"].to_numpy()
+                y_mean = cdf[sp["y_mean"]].to_numpy()
+                y_std  = cdf[sp["y_std"]].to_numpy()
+
+                line, = ax.plot(x, y_mean, marker="o", label=press_label)
+                ax.fill_between(
+                    x,
+                    y_mean - y_std,
+                    y_mean + y_std,
+                    alpha=0.15,
+                    color=line.get_color(),
+                )
+
+            ax.set_xlabel("Prompt Length (tokens)")
+            ax.set_ylabel(sp["y_label"])
+            ax.set_title(f"({sp['label']}) {sp['title']}")
+            ax.legend(title="Quant Type")
+            ax.grid(True, linestyle="--", alpha=0.5)
+
+        fig.suptitle(f"Latency Benchmark — {model_name}", fontweight="bold", fontsize=13)
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+        safe_name = model_name.replace("/", "_").replace(" ", "_")
+        plot_path = output_dir / f"latency_{safe_name}.png"
+        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        log.info("Saved plot → %s", plot_path)

@@ -1,3 +1,6 @@
+from collections import defaultdict
+import csv
+import math
 import os
 import sys
 import traceback
@@ -7,15 +10,16 @@ import pandas as pd
 import torch
 
 from pathlib import Path
-from transformers import DynamicCache
-import matplotlib.pyplot as plt
+from transformers import DynamicCache, QuantizedCache
+
+from methods.quant.fp8_press import FP8Press
 
 CURRENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CURRENT_DIR))
 
 from harness import measure_latency, measure_perplexity
 from utils import tokenize, MODEL_ID, SUPPORTED_CTX_TYPES, load_model
-from instrumented_press import InstrumentedPress
+from methods.instrumented_press import InstrumentedPress
 from context_samples import PROSE_CONTEXT, CODE_CONTEXT
 import plots
 
@@ -371,7 +375,7 @@ def experiment_kv_growth(
 # EXPERIMENT FAMILY 2 – Perplexity vs Context Length
 # ===========================================================================
 
-def run_ppl_baseline(
+def run_ctx_baseline(
     model_names: list[str],
     contexts: list[str],
     seq_lengths: list[int] = None,
@@ -391,7 +395,7 @@ def run_ppl_baseline(
 
     for model_name in model_names:
         if model_name not in MODEL_ID:
-            log.error("Unknown model '%s' – skipping.", model_name)
+            log.error("Unknown model '%s' - skipping.", model_name)
             continue
 
         log.info("Loading model: %s", model_name)
@@ -426,131 +430,106 @@ def run_ppl_baseline(
 
     # ── One plot per model ─────────────────────────────────────────────────
     for model_name in df["model_name"].unique():
-        _plot_model(df[df["model_name"] == model_name], model_name, output_dir)
+        plots._plot_model(df[df["model_name"] == model_name], model_name, output_dir)
 
     return df
 
 
-def _plot_model(df: pd.DataFrame, model_name: str, output_dir: Path) -> None:
-    """
-    One figure per model.
-    X-axis : sequence length
-    Y-axis : perplexity
-    One line per context type (prose / code / …)
-    """
-    log = logging.getLogger("plot_ppl")
-    fig, ax = plt.subplots(figsize=(7, 4))
+def run_quant_ppls(
+    model_names: list[str],
+    output_dir: Path = OUTPUT_DIR / "perplexity",
+    seq_lengths: list[int] = None,
+) -> dict:
 
-    for ctx_type, grp in df.groupby("context_type"):
-        grp_sorted = grp.sort_values("seq_len")
-        ax.plot(
-            grp_sorted["seq_len"],
-            grp_sorted["perplexity"],
-            marker="o",
-            label=ctx_type,
-        )
-
-    ax.set_xlabel("Sequence Length (tokens)")
-    ax.set_ylabel("Perplexity")
-    ax.set_title(f"Baseline PPL vs Sequence Length — {model_name}")
-    ax.legend(title="Context")
-    ax.grid(True, linestyle="--", alpha=0.5)
-
-    fig.tight_layout()
-    path = output_dir / f"ppl_baseline_{model_name}.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    log.info("Saved plot → %s", path)
-
-def _plot_latency(
-    df: pd.DataFrame,
-    output_dir: Path,
-) -> None:
-    """
-    For each model, produces one figure with 3 subplots (A, B, C):
-        A — Prefill latency   (prefill_ms_mean  ± prefill_ms_std)   vs seq_len, one line per press_type
-        B — Decode latency    (decode_ms_mean   ± decode_ms_std)    vs seq_len, one line per press_type
-        C — Total latency     (total_ms_mean    ± total_ms_std)     vs seq_len, one line per press_type
-
-    One row of subplots (A, B, C) is produced per model_name.
-    All press types are overlaid on the same subplot for easy comparison.
-
-    Saved to: output_dir / "latency_<model_name>.png"
-    """
-    log = logging.getLogger("latency")
+    log = logging.getLogger("Quantized ppls")
     output_dir.mkdir(parents=True, exist_ok=True)
+    filename = "quant_ppls.csv"
+    ppl_rows = defaultdict(lambda: defaultdict(list))
 
-    model_names = df["model_name"].unique()
+    if seq_lengths is None:
+        seq_lengths = [60, 80, 100, 120, 160, 200, 256, 320, 512, 1024, 2048, 4096, 8192]
 
     for model_name in model_names:
-        mdf = df[df["model_name"] == model_name].copy()
-        mdf = mdf.sort_values("seq_len")
+        if model_name not in MODEL_ID:
+            log.error("Unknown model '%s' - skipping.", model_name)
+            continue
 
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        log.info("Loading model: '%s'", model_name)
+        model, tokenizer = load_model(model_name)
 
-        # ── Subplot definitions ───────────────────────────────────────
-        subplots = [
-            {
-                "ax":        axes[0],
-                "label":     "A",
-                "y_mean":    "prefill_ms_mean",
-                "y_std":     "prefill_ms_std",
-                "title":     "Prefill Latency vs Prompt Length",
-                "y_label":   "Prefill Latency (ms)",
-            },
-            {
-                "ax":        axes[1],
-                "label":     "B",
-                "y_mean":    "decode_ms_mean",
-                "y_std":     "decode_ms_std",
-                "title":     "Decode Latency vs Prompt Length",
-                "y_label":   "Decode Latency (ms/tok)",
-            },
-            {
-                "ax":        axes[2],
-                "label":     "C",
-                "y_mean":    "total_ms_mean",
-                "y_std":     "total_ms_std",
-                "title":     "Total Latency vs Prompt Length",
-                "y_label":   "Total Latency (ms)",
-            },
-        ]
+        for seq_len in seq_lengths:
+            fp8_press      = FP8Press()
+            hqq_8bit_cache = QuantizedCache(
+                backend=        "hqq",
+                config=         model.config,
+                nbits=          8,
+                axis_key=       1,
+                axis_value=     1,
+                residual_length=1,
+            )
+            hqq_4bit_cache = QuantizedCache(
+                backend=        "hqq",
+                config=         model.config,
+                nbits=          4,
+                axis_key=       1,
+                axis_value=     1,
+                residual_length=1,
+            )
 
-        press_types = mdf["press_type"].unique()
 
-        for sp in subplots:
-            ax = sp["ax"]
-
-            for press_label in press_types:
-                cdf = mdf[mdf["press_type"] == press_label].sort_values("seq_len")
-
-                x      = cdf["seq_len"].to_numpy()
-                y_mean = cdf[sp["y_mean"]].to_numpy()
-                y_std  = cdf[sp["y_std"]].to_numpy()
-
-                line, = ax.plot(x, y_mean, marker="o", label=press_label)
-                ax.fill_between(
-                    x,
-                    y_mean - y_std,
-                    y_mean + y_std,
-                    alpha=0.15,
-                    color=line.get_color(),
+            ppl_rows[model_name]["fp8-press"].append(
+                measure_perplexity(
+                    model=model, tokenizer=tokenizer,
+                    context_text=None, p=None, g=None,
+                    max_length=seq_len, press=fp8_press,
                 )
+            )
+            ppl_rows[model_name]["hqq-8-bit"].append(
+                measure_perplexity(
+                    model=model, tokenizer=tokenizer,
+                    context_text=None, p=None, g=None,
+                    max_length=seq_len, cache=hqq_8bit_cache,
+                )
+            )
+            ppl_rows[model_name]["hqq-4-bit"].append(
+                measure_perplexity(
+                    model=model, tokenizer=tokenizer,
+                    context_text=None, p=None, g=None,
+                    max_length=seq_len, cache=hqq_4bit_cache,
+                )
+            )
 
-            ax.set_xlabel("Prompt Length (tokens)")
-            ax.set_ylabel(sp["y_label"])
-            ax.set_title(f"({sp['label']}) {sp['title']}")
-            ax.legend(title="Quant Type")
-            ax.grid(True, linestyle="--", alpha=0.5)
+    fieldnames = [
+        "model",
+        "method",
+        "n_prefix_tokens",
+        "n_continuation_tokens",
+        "perplexity",
+        "loss",
+        "inference_ms",
+        "avg_kv_entries",
+    ]
+    output_path = output_dir / filename
 
-        fig.suptitle(f"Latency Benchmark — {model_name}", fontweight="bold", fontsize=13)
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
 
-        safe_name = model_name.replace("/", "_").replace(" ", "_")
-        plot_path = output_dir / f"latency_{safe_name}.png"
-        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        log.info("Saved plot → %s", plot_path)
+        for model_name, methods in ppl_rows.items():
+            for method_label, rows in methods.items():
+                for row in rows:
+                    writer.writerow({
+                        "model":  model_name,
+                        "method": method_label,
+                        **{k: ("" if isinstance(v, float) and math.isnan(v) else v)
+                           for k, v in row.items()},
+                    })
+
+    log.info(f"Results saved to {output_path}")
+    plots.plot_quant_ppls(ppl_rows, output_dir)
+    log.info("plots saved.")
+
+    return ppl_rows
 
 
 def run_latencies(
@@ -632,7 +611,7 @@ def run_latencies(
         combined.to_csv(csv_path, index=False)
         log.info("Saved combined CSV → %s", csv_path)
 
-        _plot_latency(combined, output_dir)
+        plots._plot_latency(combined, output_dir)
 
     return combined
 # ===========================================================================
@@ -655,7 +634,7 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument(
         "--experiments", nargs="+",
-        choices=["instrumented", "kv_growth", "ppl_vs_ctx", "latency", "all"],
+        choices=["instrumented", "kv_growth", "ppl_vs_ctx", "quant_ppl", "latency", "all"],
         default=["all"],
         help="Which experiment families to run.",
     )
@@ -690,7 +669,8 @@ if __name__ == "__main__":
     run_all          = "all" in args.experiments
     run_instrumented = run_all or "instrumented" in args.experiments
     run_kv_growth    = run_all or "kv_growth"    in args.experiments
-    run_ppl          = run_all or "ppl_vs_ctx"   in args.experiments
+    run_ppl_ctx          = run_all or "ppl_vs_ctx"   in args.experiments
+    run_quant_ppl = run_all or "quant_ppl" in args.experiments
     run_latency       = run_all or "latency"       in args.experiments
 
     log.info("Models: %s | Contexts: %s", args.models, args.contexts)
@@ -721,11 +701,17 @@ if __name__ == "__main__":
         )
 
     # ── Experiment Family 2: Perplexity vs context length ───────────────────
-    if run_ppl:
-        run_ppl_baseline(
+    if run_ppl_ctx:
+        run_ctx_baseline(
             model_names = args.models,
             contexts    = args.contexts,
             seq_lengths = args.seq_lengths,
+        )
+
+    if run_quant_ppl:
+        run_quant_ppls(
+            model_names = args.models,
+            seq_lengths = args.seq_lengths
         )
 
     if run_latency:
