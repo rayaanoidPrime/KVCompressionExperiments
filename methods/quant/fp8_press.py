@@ -38,7 +38,15 @@ _E5M2_MANT_SCALE = 4  # 2^2 = 4 discrete mantissa levels
 # Core FP8 quantise / dequantise
 # ===========================================================================
 
-def _quantise_e4m3(x_f32: Tensor, saturation_mode:str = 'SAT', rounding_mode:str = 'NEAREST_EVEN') -> Tensor:
+def _stochastic_round(x: Tensor):
+    floor = torch.floor(x)
+    frac = x - floor
+    noise = torch.rand_like(x)
+
+    # if noise is lesser than frac, round up
+    return floor + (noise < frac).to(x.dtype)
+
+def _quantise_e4m3(x_f32: Tensor, saturation_mode:str = 'SAT', rounding_mode:str = 'STOCHASTIC') -> Tensor:
     """
     Quantise a float32 tensor to e4m3 fp8, returned as uint8 bit patterns.
 
@@ -82,7 +90,11 @@ def _quantise_e4m3(x_f32: Tensor, saturation_mode:str = 'SAT', rounding_mode:str
 
     # Rounded mantissa (3 bits → 0 … 7)
     mant_frac = scaled_mant - 1  # ∈ [0, 1)
-    mant_int = torch.round(mant_frac * _E4M3_MANT_SCALE).to(torch.int32)
+
+    if rounding_mode == "STOCHASTIC":
+        mant_int = _stochastic_round(mant_frac * _E4M3_MANT_SCALE).to(torch.int32)
+    else:
+        mant_int = torch.round(mant_frac * _E4M3_MANT_SCALE).to(torch.int32)
 
     # ----- Carry from mantissa round-to-8 -----
     carry = mant_int >= _E4M3_MANT_SCALE
@@ -99,9 +111,13 @@ def _quantise_e4m3(x_f32: Tensor, saturation_mode:str = 'SAT', rounding_mode:str
         scaled_mant * (2.0 ** (binary_exp + 6).float()),
         torch.zeros_like(scaled_mant),
     )
-    subnorm_mant_int = torch.round(subnorm_mant_frac * _E4M3_MANT_SCALE).to(
+
+    if rounding_mode == "STOCHASTIC":
+        subnorm_mant_int = _stochastic_round(subnorm_mant_frac * _E4M3_MANT_SCALE).to(torch.int32)
+    else:
+        subnorm_mant_int = torch.round(subnorm_mant_frac * _E4M3_MANT_SCALE).to(
         torch.int32
-    )
+        )
     subnorm_mant_int = subnorm_mant_int.clamp(0, _E4M3_MANT_SCALE - 1)
 
     # override if subnormal
