@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from pathlib import Path
-from transformers import DynamicCache, QuantizedCache
+from transformers import DynamicCache, HQQQuantizedLayer, QuantizedCache
 
 from methods.quant.fp8_press import FP8Press
 
@@ -18,7 +18,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CURRENT_DIR))
 
 from harness import measure_latency, measure_perplexity
-from utils import tokenize, MODEL_ID, SUPPORTED_CTX_TYPES, load_model
+from utils import compute_sqnr, load_wikitext, tokenize, MODEL_ID, SUPPORTED_CTX_TYPES, load_model
 from methods.instrumented_press import InstrumentedPress
 from context_samples import PROSE_CONTEXT, CODE_CONTEXT
 import plots
@@ -614,6 +614,139 @@ def run_latencies(
         plots._plot_latency(combined, output_dir)
 
     return combined
+
+def run_sqnr_experiments(model_names:list[str], output_dir: Path = OUTPUT_DIR / "sqnr", max_length:int = 2048 ):
+    """
+    for each model, captures the real fp16 KV Cache tensors from a forward pass,
+    then measures the SQNR and effective bits/element for each quantization method.
+
+    Methods compared:
+        BF16 (baseline), FP8(stochastic rounding), HQQ 8 bits, HQQ 4 bits, HQQ 2 bits
+
+    Returns a Dataframe with columns:
+        model, method, bits, layer_idx, sqnr_keys, sqnr_values
+    """
+
+    log = logging.getLogger("SQNR Exp")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    rows = []
+
+    for model_name in model_names:
+        if model_name not in MODEL_ID:
+            log.error("Unknown model '%s' - skipping.", model_name)
+            continue
+
+        log.info(f"Loading model : {model_name}")
+        model, tokenizer = load_model(model_name=model_name, device=device)
+
+        input_ids = load_wikitext(device=device,tokenizer=tokenizer,seq_len=max_length)
+        n_tokens = input_ids.shape[1]
+
+        # build all the caches / quantized presses
+        baseline_cache = DynamicCache(config=model.config)
+        fp8_press      = FP8Press()
+        hqq_8bit_cache = QuantizedCache(
+            backend=        "hqq",
+            config=         model.config,
+            nbits=          8,
+            axis_key=       1,
+            axis_value=     1,
+            residual_length=0,
+        )
+        hqq_4bit_cache = QuantizedCache(
+            backend=        "hqq",
+            config=         model.config,
+            nbits=          4,
+            axis_key=       1,
+            axis_value=     1,
+            residual_length=0,
+        )
+        hqq_2bit_cache = QuantizedCache(
+            backend=        "hqq",
+            config=         model.config,
+            nbits=          2,
+            axis_key=       1,
+            axis_value=     1,
+            residual_length=0,
+        )
+        
+        # capture the fp16 kv tensors -- no compression 
+        with torch.no_grad():
+            baseline_outputs = model(
+                input_ids,
+                past_key_values=baseline_cache,
+                cache_position=torch.arange(n_tokens, device=device),
+                use_cache=True
+            )
+
+        n_layers = len(baseline_cache.layers)
+        log.info(f"capture {n_layers}")
+
+        # per layer sqnr
+        for layer_idx in range(n_layers):
+            k_fp16 = baseline_cache.layers[layer_idx].keys.float()
+            v_fp16 = baseline_cache.layers[layer_idx].values.float()
+
+            k_fp8, v_fp8, _, _ = fp8_press._roundtrip(k_fp16, v_fp16)
+
+            cl_hqq_8bit: HQQQuantizedLayer = hqq_8bit_cache.layers[layer_idx]
+            cl_hqq_4bit: HQQQuantizedLayer = hqq_4bit_cache.layers[layer_idx]
+            cl_hqq_2bit: HQQQuantizedLayer = hqq_2bit_cache.layers[layer_idx]
+
+            k_hqq_8bit = cl_hqq_8bit._dequantize(cl_hqq_8bit._quantize(k_fp16, axis=cl_hqq_8bit.axis_key))
+            v_hqq_8bit = cl_hqq_8bit._dequantize(cl_hqq_8bit._quantize(v_fp16, axis=cl_hqq_8bit.axis_value))
+
+            k_hqq_4bit = cl_hqq_4bit._dequantize(cl_hqq_4bit._quantize(k_fp16, axis=cl_hqq_4bit.axis_key))
+            v_hqq_4bit = cl_hqq_4bit._dequantize(cl_hqq_4bit._quantize(v_fp16, axis=cl_hqq_4bit.axis_value))
+
+            k_hqq_2bit = cl_hqq_2bit._dequantize(cl_hqq_2bit._quantize(k_fp16, axis=cl_hqq_2bit.axis_key))
+            v_hqq_2bit = cl_hqq_2bit._dequantize(cl_hqq_2bit._quantize(v_fp16, axis=cl_hqq_2bit.axis_value))
+            
+            rows.append({
+                "model": model_name,
+                "method" : "fp8-e4m3",
+                "bits": 8,
+                "layer_idx": layer_idx,
+                "sqnr_keys" :compute_sqnr(original=k_fp16, reconstructed=k_fp8),
+                "sqnr_values" : compute_sqnr(original=v_fp16, reconstructed=v_fp8)
+            })
+            rows.append({
+                "model": model_name,
+                "method" : "hqq-8bit",
+                "bits": 8,
+                "layer_idx": layer_idx,
+                "sqnr_keys" :compute_sqnr(original=k_fp16, reconstructed=k_hqq_8bit),
+                "sqnr_values" : compute_sqnr(original=v_fp16, reconstructed=v_hqq_8bit)
+            })
+            rows.append({
+                "model": model_name,
+                "method" : "hqq-4bit",
+                "bits": 4,
+                "layer_idx": layer_idx,
+                "sqnr_keys" :compute_sqnr(original=k_fp16, reconstructed=k_hqq_4bit),
+                "sqnr_values" : compute_sqnr(original=v_fp16, reconstructed=v_hqq_4bit)
+            })
+            rows.append({
+                "model": model_name,
+                "method" : "hqq-2bit",
+                "bits": 2,
+                "layer_idx": layer_idx,
+                "sqnr_keys" :compute_sqnr(original=k_fp16, reconstructed=k_hqq_2bit),
+                "sqnr_values" : compute_sqnr(original=v_fp16, reconstructed=v_hqq_2bit)
+            })
+
+        del model
+    
+    df = pd.DataFrame(rows)
+    df.to_csv(output_dir / "sqnr_csv.csv")
+
+    log.info(f"saved csv to {output_dir} / sqnr_csv.csv")
+
+    plot_sqnr(output_dir / "sqnr_csv.csv")
+
+
+        
+
 # ===========================================================================
 # CLI
 # ===========================================================================
@@ -634,7 +767,7 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument(
         "--experiments", nargs="+",
-        choices=["instrumented", "kv_growth", "ppl_vs_ctx", "quant_ppl", "latency", "all"],
+        choices=["instrumented", "kv_growth", "ppl_vs_ctx", "quant_ppl", "latency", "sqnr", "all"],
         default=["all"],
         help="Which experiment families to run.",
     )
@@ -666,12 +799,13 @@ if __name__ == "__main__":
     PLOT_DIR   = OUTPUT_DIR / "plots"
     PPL_DIR    = OUTPUT_DIR / "perplexity"
 
-    run_all          = "all" in args.experiments
+    run_all = "all" in args.experiments
     run_instrumented = run_all or "instrumented" in args.experiments
-    run_kv_growth    = run_all or "kv_growth"    in args.experiments
-    run_ppl_ctx          = run_all or "ppl_vs_ctx"   in args.experiments
+    run_kv_growth = run_all or "kv_growth"    in args.experiments
+    run_ppl_ctx = run_all or "ppl_vs_ctx"   in args.experiments
     run_quant_ppl = run_all or "quant_ppl" in args.experiments
-    run_latency       = run_all or "latency"       in args.experiments
+    run_latency = run_all or "latency"       in args.experiments
+    run_sqnr = run_all or "sqnr" in args.experiments
 
     log.info("Models: %s | Contexts: %s", args.models, args.contexts)
 
@@ -700,6 +834,12 @@ if __name__ == "__main__":
             seq_lengths = args.seq_lengths,
         )
 
+    if run_sqnr:
+        run_sqnr_experiments(
+            model_name=args.model_names,
+            output_dir=args.output_dir,
+        )
+
     # ── Experiment Family 2: Perplexity vs context length ───────────────────
     if run_ppl_ctx:
         run_ctx_baseline(
@@ -714,6 +854,7 @@ if __name__ == "__main__":
             seq_lengths = args.seq_lengths
         )
 
+    # -- Experiment family 3: latency vs Sequence length
     if run_latency:
         run_latencies(
             model_names= args.models,

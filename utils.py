@@ -64,10 +64,6 @@ def extract_keys_and_values(cache: Cache, layer_idx: int) -> tuple[torch.Tensor,
 
 
 def load_wikitext(tokenizer: AutoTokenizer, seq_len, device:str):
-    """
-    Load wikitext-2 text, concatenate all the text, tokenize 
-    and return the first n overlapping chunks
-    """
     fulltext = WIKITEXT_PATH.read_text(encoding='utf-8')
     tokens = tokenizer(fulltext, return_tensors='pt',add_special_tokens=False,
                        trucation=True, max_length=seq_len)["input_ids"]
@@ -80,3 +76,16 @@ def load_wikitext(tokenizer: AutoTokenizer, seq_len, device:str):
     return tokens 
 
     
+def compute_sqnr(original: torch.Tensor, reconstructed: torch.Tensor) -> float:
+    """
+    Signal to Quantization Ration in db. Higher -> better fidelity
+    """
+
+    signal_power = original.float().pow(2).mean()
+    noise = original.float() - reconstructed.float()
+    noise_power = noise.pow(2).mean()
+
+    if noise_power == 0:
+        return float('inf')
+    return 10.0 * torch.log10( signal_power / noise_power).item()
+
