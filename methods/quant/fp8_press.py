@@ -5,7 +5,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from quant_press import QuantizedPress
+from methods.quant.quant_press import QuantizedPress
 
 logger = logging.getLogger(__name__)
 
@@ -14,13 +14,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # E4M3: 1 sign, 4 exponent, 3 mantissa (bias=7)
-# Max normal: ±240.0  (E=14,M=7 → 2^7 × 1.875)
+# Max normal: ±448.0  (E=14,M=7 → 2^7 × 1.875)
 # No infinities – exponent 15 encodes NaN
 _E4M3_EXPONENT_BITS = 4
 _E4M3_MANTISSA_BITS = 3
 _E4M3_BIAS = 7
-_E4M3_MAX_NORMAL = 240.0
-_E4M3_MAX_EXP = 14  # encoded exponent max for normal values
+_E4M3_MAX_NORMAL = 448.0
+_E4M3_MAX_EXP = 15  # encoded exponent max for normal values
 _E4M3_MANT_SCALE = 8  # 2^3 = 8 discrete mantissa levels
 
 # E5M2: 1 sign, 5 exponent, 2 mantissa (bias=15)
@@ -38,7 +38,7 @@ _E5M2_MANT_SCALE = 4  # 2^2 = 4 discrete mantissa levels
 # Core FP8 quantise / dequantise
 # ===========================================================================
 
-def _quantise_e4m3(x_f32: Tensor) -> Tensor:
+def _quantise_e4m3(x_f32: Tensor, saturation_mode:str = 'SAT', rounding_mode:str = 'NEAREST_EVEN') -> Tensor:
     """
     Quantise a float32 tensor to e4m3 fp8, returned as uint8 bit patterns.
 
@@ -46,7 +46,7 @@ def _quantise_e4m3(x_f32: Tensor) -> Tensor:
 
     Strategy (per element)
     ----------------------
-    1. Specials (NaN / Inf) → NaN (0b01111111, 0b11111111)
+    1. Specials (NaN / Inf) → NaN (0b01111111, 0b11111111) ; all E and M bits are 1
     2. Zeros → ±0
     3. finfo.largest ≤ |x| → clamp to MAX_NORMAL
     4. |x| < 2⁻⁹ (half the smallest subnormal) → flush to zero
@@ -54,14 +54,19 @@ def _quantise_e4m3(x_f32: Tensor) -> Tensor:
        on mantissa overflow; saturate exponent when needed.
     """
     sign = x_f32 < 0  # bool
+
+    # saturate all overflowing values to max e4m3 value
     a = torch.abs(x_f32)
     a = a.clamp(max=_E4M3_MAX_NORMAL)
 
     # --- Specials ---
     is_nan = torch.isnan(x_f32)
     is_inf = torch.isinf(x_f32)
-    is_special = is_nan | is_inf
-    is_zero = (a == 0) | (a < (1.0 / 512.0))  # flush to zero below 2⁻⁹
+    a = torch.where(is_inf, torch.clamp(a, max=_E4M3_MAX_NORMAL), a)
+    is_special = is_nan 
+
+    # flush to zero below 2⁻⁹ as this is smallest possible e4m3 subnormal value
+    is_zero = (a == 0) | (a < (1.0 / 512.0))  
 
     # --- Normal / subnormal quantisation ---
     mant_f32, exp_f32 = torch.frexp(a.clamp(min=torch.finfo(torch.float32).tiny))
@@ -98,19 +103,21 @@ def _quantise_e4m3(x_f32: Tensor) -> Tensor:
         torch.int32
     )
     subnorm_mant_int = subnorm_mant_int.clamp(0, _E4M3_MANT_SCALE - 1)
+
+    # override if subnormal
     mant_int = torch.where(subnormal, subnorm_mant_int, mant_int)
     enc_exp = torch.where(subnormal, torch.zeros_like(enc_exp), enc_exp)
 
     # ----- Saturate exponent overflow -----
     overflow = enc_exp > _E4M3_MAX_EXP
-    enc_exp = torch.where(overflow, torch.tensor(_E4M3_MAX_EXP, dtype=torch.int32), enc_exp)
+    enc_exp = torch.where(overflow, torch.tensor(_E4M3_MAX_EXP, dtype=torch.int32), enc_exp) # clamp to 15
     mant_int = torch.where(
         overflow,
         torch.full_like(mant_int, _E4M3_MANT_SCALE - 1),
         mant_int,
     )
 
-    # ----- Flush to zero -----
+    # ----- Flush to zero if lesser than lowest subnormal value -----
     mant_int = torch.where(is_zero, torch.zeros_like(mant_int), mant_int)
     enc_exp = torch.where(is_zero, torch.zeros_like(enc_exp), enc_exp)
 
@@ -148,7 +155,7 @@ def _dequantise_e4m3(packed: Tensor, shape: tuple, orig_dtype: torch.dtype) -> T
     subnormal_val = mant_frac * (2.0 ** (-_E4M3_BIAS + 1))
 
     # NaN → NaN
-    is_nan = (enc_exp == (_E4M3_MAX_EXP + 1)) & (mant > 0)
+    is_nan = (enc_exp == (_E4M3_MAX_EXP)) & (mant > 0)
     is_nan = is_nan.to(torch.bool)
 
     val = torch.where(normal, normal_val, subnormal_val)
@@ -162,7 +169,7 @@ def _dequantise_e4m3(packed: Tensor, shape: tuple, orig_dtype: torch.dtype) -> T
 # E5M2
 # ---------------------------------------------------------------------------
 
-def _quantise_e5m2(x_f32: Tensor) -> Tensor:
+def _quantise_e5m2(x_f32: Tensor, **kwargs) -> Tensor:
     """
     Quantise a float32 tensor to e5m2 fp8, returned as uint8 bit patterns.
 
@@ -310,16 +317,16 @@ class FP8Press(QuantizedPress):
 
     Converts each key / value tensor from its original floating-point type
     (typically bfloat16 or float16) to an 8-bit floating-point format, then
-    back again on decode.  This yields a **2× compression ratio** (16 bpc → 8
+    back again on decode.  This yields a **2x compression ratio** (16 bpc → 8
     bpc) with the rounding behaviour of IEEE-style floating point.
 
     Parameters
     ----------
     format : str, either ``"e4m3"`` (default) or ``"e5m2"``.
-        ``e4m3`` – 4 exponent bits, 3 mantissa bits.  Dynamic range ±240
+        ``e4m3`` - 4 exponent bits, 3 mantissa bits.  Dynamic range ±240
         with finer precision for values near zero.  This is the default
         because KV-cache values rarely exceed ±100 (see instrumented outputs).
-        ``e5m2`` – 5 exponent bits, 2 mantissa bits.  Much larger dynamic
+        ``e5m2`` - 5 exponent bits, 2 mantissa bits.  Much larger dynamic
         range (±57344) but coarser precision.  Prefer this when the KV tensors
         contain large-magnitude values.
 
@@ -332,6 +339,8 @@ class FP8Press(QuantizedPress):
     """
 
     format: str = "e4m3"
+    rounding_mode:str = "STOCHASTIC" # nearest, stochastic
+    saturation_mode:str = "SAT" # sat, unsat
 
     def __post_init__(self) -> None:
         self.format = self.format.lower()
@@ -345,7 +354,7 @@ class FP8Press(QuantizedPress):
     def _encode(self, x: Tensor) -> tuple[Any, dict]:
         quantise_fn = _QUANTISE_MAP[self.format]
         x_f32 = x.detach().float()
-        compressed = quantise_fn(x_f32)
+        compressed = quantise_fn(x_f32, saturation_mode=self.saturation_mode, rounding_mode=self.rounding_mode)
         meta = {
             "shape": tuple(x.shape),
             "dtype": str(x.dtype),
@@ -380,7 +389,7 @@ class NativeFP8Press(QuantizedPress):
     The compressed representation is stored directly as a ``torch.float8``
     tensor — no manual bit manipulation.
 
-    This yields a **2× compression ratio** (16 bpc → 8 bpc).
+    This yields a **2x compression ratio** (16 bpc → 8 bpc).
 
     Parameters
     ----------
@@ -388,6 +397,8 @@ class NativeFP8Press(QuantizedPress):
     """
 
     format: str = "e4m3"
+    saturation_mode:str = "SAT"
+    rounding_mode:str = "STOCHASTIC"
 
     def __post_init__(self) -> None:
         self.format = self.format.lower()
